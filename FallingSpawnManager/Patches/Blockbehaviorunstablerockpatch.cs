@@ -49,13 +49,15 @@ public static class BlockBehaviorUnstableRockPatch
         IOrderedEnumerable<BlockPos> yorderedPositions,
         int y)
     {
-
-
+        
         FallingSpawnManager fsm = world.Api.ModLoader.GetModSystem<FallingSpawnManager>();
 
         AssetLocation fallSound = _fallSoundRef(__instance);
         float impactDamageMul = _impactDamageMulRef(__instance);
         float dustIntensity = _dustIntensityRef(__instance);
+
+        Block block;
+        BlockBehaviorUnstableRock bh;
 
         foreach (BlockPos pos in yorderedPositions)
         {
@@ -72,8 +74,8 @@ public static class BlockBehaviorUnstableRockPatch
                 return false; // skip original
             }
 
-            Block block = world.BlockAccessor.GetBlock(pos, BlockLayersAccess.Solid);
-            BlockBehaviorUnstableRock bh = block.GetBehavior<BlockBehaviorUnstableRock>();
+            block = world.BlockAccessor.GetBlock(pos, BlockLayersAccess.Solid);
+            bh = block.GetBehavior<BlockBehaviorUnstableRock>();
 
             if (bh == null || fsm == null)
                 continue;

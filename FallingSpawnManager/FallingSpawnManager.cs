@@ -11,14 +11,14 @@ using Vintagestory.API.Server;
 using Vintagestory.GameContent;
 
 
-[assembly: ModDependency("game", "1.21.6")]
+[assembly: ModDependency("game", "1.22.0-rc.5")]
 [assembly: ModInfo(
     "Falling blocks spawn manager",
     "fallingspawnmanager",
     Website = "https://github.com/tehtelev/FallingSpawnManager",
     Description = "Limits the number of blocks falling at the same time.",
-    Version = "0.0.2",
-    Authors = new[] { "Tehtelev"}
+    Version = "0.1.0",
+    Authors = new[] { "Tehtelev" }
 )]
 
 
@@ -113,17 +113,17 @@ namespace FallingSpawnManager
             else
                 api.Logger.Error("collapseLayer not found");
 
-            // BlockBehaviorUnstableFalling.TryFalling
-            var tryFallingMethod = AccessTools.Method(typeof(BlockBehaviorUnstableFalling), "TryFalling",
-                new Type[] { typeof(IWorldAccessor), typeof(BlockPos), typeof(EnumHandling).MakeByRefType() });
+            // BlockBehaviorUnstableFalling.createFallingBlock
+            var tryFallingMethod = AccessTools.Method(typeof(BlockBehaviorUnstableFalling), "createFallingBlock",
+                new Type[] { typeof(IWorldAccessor), typeof(BlockPos) });
             if (tryFallingMethod != null)
             {
                 harmony.Patch(tryFallingMethod,
-                    prefix: new HarmonyMethod(typeof(BlockBehaviorUnstableFallingPatch), nameof(BlockBehaviorUnstableFallingPatch.TryFalling_Prefix)));
+                    prefix: new HarmonyMethod(typeof(BlockBehaviorUnstableFallingPatch), nameof(BlockBehaviorUnstableFallingPatch.createFallingBlock_Prefix)));
             }
             else
             {
-                api.Logger.Error("Could not find BlockBehaviorUnstableFalling.TryFalling");
+                api.Logger.Error("Could not find BlockBehaviorUnstableFalling.createFallingBlock");
             }
         }
 
@@ -333,6 +333,6 @@ namespace FallingSpawnManager
     /// </summary>
     public class FSMConfig
     {
-        public int MaxFallingLimit = 200;
+        public int MaxFallingLimit = 500;
     }
 }
