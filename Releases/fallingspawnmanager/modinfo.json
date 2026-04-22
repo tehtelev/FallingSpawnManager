@@ -6,8 +6,8 @@
     "Tehtelev"
   ],
   "description": "Limits the number of blocks falling at the same time",
-  "Version": "0.1.0",
+  "Version": "0.1.1",
   "dependencies": {
-    "game": "1.22.0-rc.5"
+    "game": "1.22.0"
   }
 }

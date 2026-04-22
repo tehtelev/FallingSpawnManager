@@ -11,13 +11,13 @@ using Vintagestory.API.Server;
 using Vintagestory.GameContent;
 
 
-[assembly: ModDependency("game", "1.22.0-rc.5")]
+[assembly: ModDependency("game", "1.22.0")]
 [assembly: ModInfo(
     "Falling blocks spawn manager",
     "fallingspawnmanager",
     Website = "https://github.com/tehtelev/FallingSpawnManager",
     Description = "Limits the number of blocks falling at the same time.",
-    Version = "0.1.0",
+    Version = "0.1.1",
     Authors = new[] { "Tehtelev" }
 )]
 
