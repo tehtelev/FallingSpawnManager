@@ -11,42 +11,39 @@ using Vintagestory.API.Server;
 using Vintagestory.GameContent;
 
 
-[assembly: ModDependency("game", "1.22.0")]
-[assembly: ModInfo(
-    "Falling blocks spawn manager",
-    "fallingspawnmanager",
-    Website = "https://github.com/tehtelev/FallingSpawnManager",
-    Description = "Limits the number of blocks falling at the same time.",
-    Version = "0.1.1",
-    Authors = new[] { "Tehtelev" }
-)]
-
-
-
 namespace FallingSpawnManager
 {
     /// <summary>
-    /// Server-side spawn manager for falling blocks.
-    /// Limits the number of concurrently existing EntityBlockFalling instances,
-    /// queues spawn requests, and performs instant simulation for blocks outside player range.
+    /// Серверный менеджер спавна падающих блоков.
+    /// Ограничивает число одновременно существующих EntityBlockFalling, ставит заявки
+    /// в очередь и прогоняет мгновенную симуляцию для блоков за пределами видимости игроков.
     /// </summary>
     public class FallingSpawnManager : ModSystem
     {
-        // Total number of loaded EntityBlockFalling instances on the server
+        // Флаг инициализации, чтобы не регистрировать события повторно при перезагрузке мода
+        private bool _initialized = false;
+
+        // Общее число загруженных сущностей EntityBlockFalling на сервере
         private static int totalFallingBlocks = 0;
-        // Queue of spawn requests waiting for a free slot
+
+        // Очередь заявок на спавн, которые ждут свободного слота
         private static Queue<SpawnRequest> requestQueue = new Queue<SpawnRequest>();
-        // Positions that already have a pending request — prevents duplicates
+
+        // Позиции с уже повешенной заявкой — чтобы не дублировать спавн
         private static HashSet<BlockPos> pendingPositions = new HashSet<BlockPos>();
 
         private static ICoreServerAPI sapi;
-        // Radius around a player within which entities are created (in blocks)
+
+        // Радиус вокруг игрока, в котором создаются сущности (в блоках)
         private static int activeRange = 128;
-        // патчи Harmony
+
+        // Harmony-патчи
         private Harmony harmony;
+
         // Конфигурация мода, загружается при старте
         private FSMConfig? _config;
-        // максимальное число падающих блоков
+
+        // Максимальное число падающих блоков
         public static int maxFallingLimit;
 
         public override bool ShouldLoad(EnumAppSide forSide)
@@ -63,24 +60,12 @@ namespace FallingSpawnManager
         /// <param name="api"></param>
         public override void StartPre(ICoreAPI api)
         {
-            // грузим конфиг
-            // если конфиг с ошибкой или не найден, то генерируется стандартный
+            // Грузим конфиг. Если его нет или он с ошибкой — берём значения по умолчанию
             _config = api.LoadModConfig<FSMConfig>("FallingSpawnManagerConfig.json") ?? new FSMConfig();
             api.StoreModConfig(_config, "FallingSpawnManagerConfig.json");
 
-            // проверяем, что конфиг валиден, и обрезаются значения
+            // Обрезаем значение до валидного диапазона
             maxFallingLimit = Math.Clamp(_config.MaxFallingLimit, 10, 10000);
-
-
-        }
-
-
-        public override void Start(ICoreAPI api)
-        {
-            harmony = new Harmony("fallingspawnmanager");
-
-            // Регистрация всех патчей
-            RegisterPatches(api);
         }
 
 
@@ -129,24 +114,36 @@ namespace FallingSpawnManager
 
         public override void StartServerSide(ICoreServerAPI api)
         {
+            if (_initialized)
+                return; // защита от повторного старта/патчинга
+
+            harmony = new Harmony("fallingspawnmanager");
+
+            // Регистрация всех патчей
+            RegisterPatches(api);
+
             sapi = api;
 
-            // Determine entity tracking radius from server settings
+            // Радиус слежения берём из настроек сервера
             try
             {
                 int trackingChunks = api.World.DefaultEntityTrackingRange;
                 activeRange = trackingChunks * GlobalConstants.ChunkSize;
             }
-            catch { /* keep default of 128 */ }
+            catch { /* оставляем дефолтное значение 128 */ }
 
             api.Event.OnEntitySpawn += OnEntitySpawn;
             api.Event.OnEntityLoaded += OnEntityLoaded;
             api.Event.OnEntityDespawn += OnEntityDespawn;
-            // Spawn queue tick — every 32 ms
+
+            // Тик очереди спавна — каждые 32 мс
             api.Event.RegisterGameTickListener(OnGameTick, 32);
+
+            _initialized = true;
+
         }
 
-        // Counters: only track EntityBlockFalling, not living creatures
+        // Считаем только EntityBlockFalling, а не живых существ
         private void OnEntitySpawn(Entity entity)
         {
             if (!entity.IsCreature && entity is EntityBlockFalling) totalFallingBlocks++;
@@ -163,8 +160,7 @@ namespace FallingSpawnManager
         }
 
         /// <summary>
-        /// Process the spawn queue each game tick.
-        /// Spawn as many entities as the limit allows.
+        /// Обрабатываем очередь спавна каждый тик. Спавним столько сущностей, сколько позволяет лимит.
         /// </summary>
         private void OnGameTick(float dt)
         {
@@ -178,12 +174,12 @@ namespace FallingSpawnManager
                 request = requestQueue.Dequeue();
                 pendingPositions.Remove(request.InitialPos);
 
-                // Verify the block at the source position hasn't changed while the request was queued
+                // Проверяем, что блок на исходной позиции не сменился за время ожидания в очереди
                 block = sapi.World.BlockAccessor.GetBlock(request.InitialPos);
                 if (block == null || block.Id == 0 || block != request.Block)
                     continue;
 
-                // If a falling entity already exists at this position — defer the spawn
+                // Если сущность уже существует на этой позиции — откладываем спавн
                 existing = sapi.World.GetNearestEntity(
                     request.InitialPos.ToVec3d().Add(0.5, 0.5, 0.5), 1, 1.5f,
                     e => !e.IsCreature && e is EntityBlockFalling ebf && ebf.initialPos.Equals(request.InitialPos));
@@ -191,20 +187,21 @@ namespace FallingSpawnManager
                 if (existing != null)
                 {
                     request.RetryCount++;
-                    if (request.RetryCount >= 300) // ~10 seconds at 32 ms tick interval
+                    if (request.RetryCount >= 300) // ~10 секунд при тике в 32 мс
                     {
-                        // After 300 failed attempts — give up and drop items
+                        // Если 300 раз подряд позиция занята — сдаёмся и выбрасываем предметы
                         var drops = request.Block.GetDrops(sapi.World, request.InitialPos, null);
                         EntityBlockFallingPatch.SpawnDrops(sapi.World, request.InitialPos, drops, request.BlockEntity);
                         continue;
                     }
-                    // Return the request to the back of the queue for another attempt
+
+                    // Возвращаем заявку в конец очереди ещё раз
                     pendingPositions.Add(request.InitialPos);
                     requestQueue.Enqueue(request);
                     continue;
                 }
 
-                // Create the entity and apply position offset if specified
+                // Создаём сущность и применяем смещение позиции, если оно задано
                 entityBf = new EntityBlockFalling(
                     request.Block, request.BlockEntity, request.InitialPos,
                     request.FallSound, request.ImpactDamageMul,
@@ -225,20 +222,20 @@ namespace FallingSpawnManager
         }
 
         /// <summary>
-        /// Requests a block to fall.
-        /// If a player is nearby — creates an entity (queued if at the limit).
-        /// If no players are nearby — performs instant simulation without an entity.
+        /// Просит блок упасть.
+        /// Если игрок рядом — создаёт сущность (в очередь, если достигнут лимит).
+        /// Если никого нет — прогоняет мгновенную симуляцию без создания сущности.
         /// </summary>
         public void RequestSpawn(Block block, BlockEntity be, BlockPos initialPos,
                                  AssetLocation fallSound, float impactDamageMul,
                                  bool canFallSideways, float dustIntensity,
                                  bool doRemoveBlock = true, Vec3d positionOffset = null)
         {
-            // Skip duplicates — this position already has a pending request
+            // Пропускаем дубликаты — для этой позиции уже есть заявка
             if (pendingPositions.Contains(initialPos))
                 return;
 
-            // Check whether at least one player is within activeRange
+            // Проверяем, есть ли игрок внутри activeRange
             bool hasPlayerNearby = false;
             Vec3d posVec = initialPos.ToVec3d();
             EntityPlayer eplr;
@@ -254,13 +251,13 @@ namespace FallingSpawnManager
 
             if (!hasPlayerNearby)
             {
-                // No players nearby — no need to create an entity, simulate instantly
+                // Игроков рядом нет — сущность создавать не надо, прогоняем мгновенную симуляцию
                 InstantFallSimulation(block, be, initialPos, fallSound, impactDamageMul,
                                       canFallSideways, dustIntensity, doRemoveBlock, positionOffset);
                 return;
             }
 
-            // Player is nearby — add to queue to create a full entity
+            // Игрок рядом — ставим заявку в очередь на полное создание сущности
             pendingPositions.Add(initialPos);
             requestQueue.Enqueue(new SpawnRequest
             {
@@ -277,7 +274,7 @@ namespace FallingSpawnManager
         }
 
         /// <summary>
-        /// Thin wrapper: retrieves drops and delegates simulation to the static EntityBlockFalling method.
+        /// Простой оберточный метод: берёт дропы и передаёт симуляцию в статический метод EntityBlockFalling.
         /// </summary>
         private void InstantFallSimulation(Block block, BlockEntity be, BlockPos initialPos,
                                            AssetLocation fallSound, float impactDamageMul,
@@ -291,7 +288,7 @@ namespace FallingSpawnManager
 
         public override void Dispose()
         {
-            // On mod unload, clear the queue and unsubscribe from events to avoid holding world object references
+            // При выгрузке мода чистим очередь и отвязываем события, чтобы не держать ссылки на объекты мира
             requestQueue?.Clear();
             pendingPositions?.Clear();
             totalFallingBlocks = 0;
@@ -302,12 +299,14 @@ namespace FallingSpawnManager
                 sapi.Event.OnEntityDespawn -= OnEntityDespawn;
             }
 
-            // Unpatch all Harmony patches applied by this mod
+            // Снимаем все Harmony-патчи, применённые этим модом
             harmony?.UnpatchAll("fallingspawnmanager");
+
+            _initialized = false; // для повторного старта после релоада
         }
 
         /// <summary>
-        /// Data for a single spawn request held in the queue.
+        /// Данные одной заявки на спавн в очереди.
         /// </summary>
         private struct SpawnRequest
         {
@@ -320,7 +319,9 @@ namespace FallingSpawnManager
             public float DustIntensity;
             public bool DoRemoveBlock;
             public Vec3d PositionOffset;
-            public int RetryCount; // How many times this request has been returned to the queue due to a occupied position
+
+            // Сколько раз заявку уже возвращали в очередь из-за занятой позиции
+            public int RetryCount;
         }
 
 
@@ -329,7 +330,7 @@ namespace FallingSpawnManager
 
 
     /// <summary>
-    /// Конфигуратор сети
+    /// Конфигурация мода
     /// </summary>
     public class FSMConfig
     {

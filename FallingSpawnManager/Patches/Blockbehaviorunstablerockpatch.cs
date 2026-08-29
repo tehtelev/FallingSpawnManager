@@ -1,6 +1,5 @@
 ﻿using HarmonyLib;
 using System;
-using System.Collections.Generic;
 using System.Linq;
 using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
@@ -11,21 +10,20 @@ using Vintagestory.GameContent;
 namespace FallingSpawnManager.Patches;
 
 /// <summary>
-/// Patches BlockBehaviorUnstableRock.collapseLayer so that it routes through
-/// FallingSpawnManager.RequestSpawn instead of directly spawning EntityBlockFalling.
+/// Перехватывает BlockBehaviorUnstableRock.collapseLayer и направляет спавн через
+/// FallingSpawnManager.RequestSpawn вместо прямого создания EntityBlockFalling.
 ///
-/// What changes vs the original:
-///   - The manual duplicate-entity guard is removed — FallingSpawnManager handles
-///     de-duplication via its pendingPositions HashSet.
-///   - world.SpawnEntity(new EntityBlockFalling(...)) is replaced with
-///     fsm.RequestSpawn(...).
-///   - The three checkCollapsibleNeighbours calls at the end are wrapped in
-///     RegisterCallback with staggered delays (300 / 400 / 500 ms) so that
-///     cascading collapses don't overflow the callback stack in a single tick.
+/// Чем отличается от оригинала:
+///   - Убран ручной контроль дубликатов — дедупликацию делает FallingSpawnManager
+///     своим HashSet pendingPositions.
+///   - world.SpawnEntity(new EntityBlockFalling(...)) заменён на fsm.RequestSpawn(...).
+///   - Три вызова checkCollapsibleNeighbours в конце обёрнуты в RegisterCallback с
+///     задержками 300 / 400 / 500 мс, чтобы цепные обвалы не переполняли стек
+///     колбэков за один тик.
 /// </summary>
 public static class BlockBehaviorUnstableRockPatch
 {
-    // Protected fields of BlockBehaviorUnstableRock — FieldRef gives zero-overhead ref access
+    // Защищённые поля BlockBehaviorUnstableRock — FieldRef даёт доступ без оверхеда
     private static readonly AccessTools.FieldRef<BlockBehaviorUnstableRock, AssetLocation> _fallSoundRef =
         AccessTools.FieldRefAccess<BlockBehaviorUnstableRock, AssetLocation>("fallSound");
 
@@ -39,7 +37,7 @@ public static class BlockBehaviorUnstableRockPatch
         AccessTools.FieldRefAccess<BlockBehaviorUnstableRock, Block>("collapsedBlock");
 
     /// <summary>
-    /// Prefix returns false → original method body is skipped entirely.
+    /// Вернув false, мы полностью пропускаем тело оригинального метода.
     /// </summary>
     [HarmonyPrefix]
     [HarmonyPatch(typeof(BlockBehaviorUnstableRock), "collapseLayer")]
@@ -49,7 +47,6 @@ public static class BlockBehaviorUnstableRockPatch
         IOrderedEnumerable<BlockPos> yorderedPositions,
         int y)
     {
-        
         FallingSpawnManager fsm = world.Api.ModLoader.GetModSystem<FallingSpawnManager>();
 
         AssetLocation fallSound = _fallSoundRef(__instance);
@@ -66,12 +63,12 @@ public static class BlockBehaviorUnstableRockPatch
 
             if (pos.Y > y)
             {
-                // Capture y for the lambda — pos.Y is the next layer's Y
+                // Захватываем nextY для лямбды — pos.Y это Y следующего слоя
                 int nextY = pos.Y;
                 world.Api.Event.RegisterCallback(
                     (dt) => collapseLayer_Prefix(__instance, world, yorderedPositions, nextY),
                     200);
-                return false; // skip original
+                return false; // не даём отработать оригиналу
             }
 
             block = world.BlockAccessor.GetBlock(pos, BlockLayersAccess.Solid);
@@ -91,8 +88,8 @@ public static class BlockBehaviorUnstableRockPatch
             );
         }
 
-        // Stagger the neighbour-collapse checks to avoid callback stack overflow
-        // when a large cave-in triggers many cascading collapses in the same tick.
+        // Сдвигаем проверки соседних ярусов по времени, чтобы цепной обвал не переполнил
+        // стек колбэков, если сразу сыпется целый пласт.
         BlockPos firstpos = yorderedPositions.First();
         for (int i = 0; i < 3; i++)
         {
@@ -105,13 +102,13 @@ public static class BlockBehaviorUnstableRockPatch
                 delay);
         }
 
-        return false; // skip original
+        return false; // не даём отработать оригиналу
     }
 }
 
 /// <summary>
-/// Thin helper that exposes the protected checkCollapsibleNeighbours method
-/// to the patch lambda without using reflection on every callback invocation.
+/// Тонкая оболочка вокруг защищённого checkCollapsibleNeighbours. Нужна, чтобы лямбда
+/// в колбэке могла вызвать метод без рефлексии на каждом вызове.
 /// </summary>
 internal static class BlockBehaviorUnstableRockHelper
 {

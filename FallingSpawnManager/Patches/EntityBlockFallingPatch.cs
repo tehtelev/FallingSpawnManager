@@ -1,5 +1,4 @@
-﻿using System;
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
 using HarmonyLib;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
@@ -14,18 +13,18 @@ using Vintagestory.GameContent;
 namespace FallingSpawnManager.Patches;
 
 /// <summary>
-/// Harmony patches that improve EntityBlockFalling behaviour:
-///   - Sets AlwaysActive = true and corrects SimulationRange inside Initialize.
-///   - Adds a periodic player-proximity check: when no players are nearby the block
-///     falls instantly and the entity is destroyed, preventing ghost entities.
+/// Патчи Harmony для EntityBlockFalling:
+///   - В Initialize ставим AlwaysActive = true и нормализуем SimulationRange.
+///   - Периодически проверяем, не ушёл ли игрок рядом: если никого нет — блок
+///     падает мгновенно, а сущность уничтожается, чтобы не оставалось «фантомов».
 ///
-/// Static helpers SimulateInstantFall / SpawnDrops are public so that
-/// FallingSpawnManager (separate mod) can call them without going through reflection.
+/// Статические SimulateInstantFall / SpawnDrops сделаны публичными, чтобы
+/// FallingSpawnManager (отдельный мод) мог их вызывать без рефлексии.
 /// </summary>
 public static class EntityBlockFallingPatch
 {
     // -------------------------------------------------------------------------
-    //  Reflected access to private fields (FieldRef gives zero-overhead ref)
+    //  Доступ к приватным полям через рефлексию (FieldRef даёт доступ без оверхеда)
     // -------------------------------------------------------------------------
 
     private static readonly AccessTools.FieldRef<EntityBlockFalling, bool> _fallHandledRef =
@@ -35,35 +34,35 @@ public static class EntityBlockFallingPatch
         AccessTools.FieldRefAccess<EntityBlockFalling, ItemStack[]>("drops");
 
     // -------------------------------------------------------------------------
-    //  Per-instance state that we cannot add as real fields
+    //  Состояние на каждый инстанс, которое нельзя добавить как нормальное поле
     // -------------------------------------------------------------------------
 
-    /// <summary>Extra data attached to each EntityBlockFalling instance.</summary>
+    /// <summary> Доп. данные, которые мы вешаем на каждый инстанс EntityBlockFalling. </summary>
     private sealed class ExtraData
     {
         public long LastPlayerCheckMs;
     }
 
-    // ConditionalWeakTable keeps entries alive only as long as the key is alive —
-    // no need for manual cleanup on despawn.
+    // ConditionalWeakTable хранит записи, пока жив ключ — очищать на despawn не нужно
     private static readonly ConditionalWeakTable<EntityBlockFalling, ExtraData> _extra = new();
 
     private const int PlayerCheckIntervalMs = 2000;
 
     // -------------------------------------------------------------------------
-    //  Patch 1 — Initialize
+    //  Патч 1 — Initialize
     //
-    //  Two fixes in one postfix (runs AFTER base.Initialize, so our values win):
+    //  Две правки в одном postfix (он выполняется ПОСЛЕ base.Initialize, поэтому
+    //  наши побеждают):
     //
     //  a) AlwaysActive = true
-    //     Simpler and cheaper than patching the base-class getter: we just assign
-    //     the property directly, which sets the backing field once at spawn time.
+    //     Проще и дешевле, чем патчить геттер базового класса: просто пишем свойство
+    //     напрямую — бэкинг-поле задаётся один раз в момент спавна.
     //
     //  b) SimulationRange = GlobalConstants.DefaultSimulationRange
-    //     The original writes (int)(0.75f * DefaultSimulationRange).  Using the full
-    //     default range keeps physics running over the same distance the server already
-    //     tracks entities — no extra overhead, but the proximity check can now fire
-    //     correctly when all players leave the area.
+    //     В оригинале пишется (int)(0.75f * DefaultSimulationRange). Полный дефолтный
+    //     диапазон физика прорабатывает на том же расстоянии, что сервер уже следит за
+    //     сущностями — лишних затрат нет, зато проверка близости игрока теперь срабатывает,
+    //     когда все игроки покидают область.
     // -------------------------------------------------------------------------
 
     [HarmonyPostfix]
@@ -78,15 +77,15 @@ public static class EntityBlockFallingPatch
     }
 
     // -------------------------------------------------------------------------
-    //  Patch 2 — OnGameTick: player-proximity check
+    //  Патч 2 — OnGameTick: проверка близости игрока
     //
-    //  Every PlayerCheckIntervalMs ms we check whether any player is still nearby.
-    //  If not, we run an instant fall simulation and kill the entity.  This prevents
-    //  falling-block entities from piling up in loaded-but-unattended chunks.
+    //  Раз в PlayerCheckIntervalMs мс проверяем, кто-то всё ещё рядом. Если нет —
+    //  прогоняем мгновенное падение и убиваем сущность. Так блоки не накапливаются
+    //  в загруженных, но безлюдных чанках.
     //
-    //  Using a postfix instead of a transpiler keeps the patch simple and robust
-    //  across game updates.  The one trade-off is that the rest of OnGameTick already
-    //  ran for that tick — acceptable, because the entity is destroyed immediately after.
+    //  Postfix вместо транспайлера держит патч простым и устойчивым к обновлениям игры.
+    //  Единственный минус — остальное тело OnGameTick за этот тик уже отработает;
+    //  но это неважно, потому что сущность уничтожается сразу после.
     // -------------------------------------------------------------------------
 
     [HarmonyPostfix]
@@ -96,7 +95,7 @@ public static class EntityBlockFallingPatch
         float dt)
     {
 
-        // Server-only; skip dead / already-handled entities
+        // Только сервер; пропускаем мёртвые или уже обработанные сущности
         if (__instance.Api?.Side != EnumAppSide.Server) return;
         if (!__instance.Alive) return;
         if (_fallHandledRef(__instance)) return;
@@ -112,13 +111,13 @@ public static class EntityBlockFallingPatch
     }
 
     // -------------------------------------------------------------------------
-    //  Private helpers
+    //  Вспомогательные методы
     // -------------------------------------------------------------------------
 
     private static bool IsPlayerNearby(EntityBlockFalling entity)
     {
         var sapi = entity.Api as ICoreServerAPI;
-        // Mirror the calculation used in FallingSpawnManager.RequestSpawn
+        // Пересчитываем радиус так же, как в FallingSpawnManager.RequestSpawn
         int range = (sapi?.World.DefaultEntityTrackingRange ?? 8) * GlobalConstants.ChunkSize;
         Vec3d pos = entity.Pos.XYZ;
 
@@ -133,7 +132,7 @@ public static class EntityBlockFallingPatch
 
     private static void FallNow(EntityBlockFalling entity)
     {
-        // Guard against re-entry (OnFallToGround may have set this in the same tick)
+        // Защита от повторного входа — OnFallToGround мог поставить этот флаг в тот же тик
         if (_fallHandledRef(entity)) return;
         _fallHandledRef(entity) = true;
 
@@ -145,20 +144,20 @@ public static class EntityBlockFallingPatch
             entity.removedBlockentity,
             entity.initialPos,
             drops,
-            doRemoveBlock: false   // block was already removed in Initialize
+            doRemoveBlock: false   // блок уже удалён при спавне сущности, не пытаемся удалить его снова
         );
 
         entity.Die(EnumDespawnReason.Removed);
     }
 
     // =========================================================================
-    //  Public static utilities
-    //  (used by FallingSpawnManager and the FallNow helper above)
+    //  Публичные статические utilities
+    //  (используются FallingSpawnManager и FallNow выше)
     // =========================================================================
 
     /// <summary>
-    /// Drops the block's item stacks and, if the block entity was a container,
-    /// its inventory contents at the centre of <paramref name="pos"/>.
+    /// Выбрасывает стак предметов блока и, если блочный объект был контейнером,
+    /// его инвентарь в центре
     /// </summary>
     public static void SpawnDrops(
         IWorldAccessor world,
@@ -179,18 +178,18 @@ public static class EntityBlockFallingPatch
     }
 
     /// <summary>
-    /// Instantly resolves a falling-block trajectory without creating an entity.
-    /// Descends until it finds a solid surface, then either places the block or
-    /// drops items.  Used for blocks that are outside any player's view range.
+    /// Мгновенно проходит траекторию падения без создания сущности.
+    /// Идёт вниз, пока не найдёт твёрдую поверхность, затем либо ставит блок, либо
+    /// выбрасывает предметы.  Используется для блоков за пределами видимости игроков.
     /// </summary>
-    /// <param name="world">World accessor.</param>
-    /// <param name="block">The block that is falling.</param>
-    /// <param name="be">The block entity that was attached to the block (may be null).</param>
-    /// <param name="startPos">The position the block fell from.</param>
-    /// <param name="drops">Pre-computed drops (may be null).</param>
+    /// <param name="world">Доступ к миру.</param>
+    /// <param name="block">Падающий блок.</param>
+    /// <param name="be">Блочный объект,附着 прикреплённый к блоку (может быть null).</param>
+    /// <param name="startPos">Позиция, с которой блок упал.</param>
+    /// <param name="drops">Заранее вычисленные предметы (могут быть null).</param>
     /// <param name="doRemoveBlock">
-    ///     When true the block is removed from <paramref name="startPos"/> first
-    ///     (with a validity guard).  Pass false when it was already removed.
+    ///     Если true — сначала удаляет блок из <paramref name="startPos"/> (с проверкой
+    ///     корректности). Передавать false, если блок уже был удалён.
     /// </param>
     public static void SimulateInstantFall(
         IWorldAccessor world,
@@ -202,7 +201,7 @@ public static class EntityBlockFallingPatch
     {
         if (doRemoveBlock)
         {
-            // Safety: the block may have changed while the request was queued
+            // Проверка безопасности: блок мог измениться за время ожидания в очереди
             if (world.BlockAccessor.GetBlock(startPos) != block)
                 return;
             world.BlockAccessor.SetBlock(0, startPos);
@@ -210,8 +209,8 @@ public static class EntityBlockFallingPatch
 
         BlockPos finalPos = startPos.Copy();
 
-        // Serialise the block entity once so that CanAcceptFallOnto / OnFallOnto
-        // handlers can inspect its data.
+        // Серилизуем блочный объект один раз, чтобы обработчики CanAcceptFallOnto / OnFallOnto
+        // могли осмотреть его данные.
         TreeAttribute beTree = null;
         if (be != null)
         {
@@ -221,13 +220,13 @@ public static class EntityBlockFallingPatch
 
         int worldHeight = world.BlockAccessor.MapSizeY;
 
-        // Descend through passable blocks (air, water, foliage, …)
+        // Идём вниз по проходимым блокам (воздух, вода, листва и т. п.)
         for (int i = 0; i < worldHeight; i++)
         {
             BlockPos belowPos = finalPos.DownCopy();
             Block belowBlock = world.BlockAccessor.GetMostSolidBlock(belowPos);
 
-            // Let the target block handle the landing (e.g. hopper, loose soil)
+            // Даём целевому блоку обработать приземление (например, воронка, рыхлая земля)
             if (belowBlock.CanAcceptFallOnto(world, belowPos, block, beTree))
             {
                 belowBlock.OnFallOnto(world, belowPos, block, beTree);
@@ -235,12 +234,12 @@ public static class EntityBlockFallingPatch
             }
 
             if (belowBlock.Replaceable >= 6000 || belowBlock.IsLiquid())
-                finalPos = belowPos;  // passable — keep descending
+                finalPos = belowPos;  // проходимый — продолжаем падать
             else
-                break;               // solid — stop here
+                break;               // твёрдый — останавливаемся
         }
 
-        // Validate landing position: needs a solid block below and free space at finalPos
+        // Проверяем позицию приземления: под ней должна быть твёрдая опора, а в finalPos — свободное место
         Block targetBlock = world.BlockAccessor.GetBlock(finalPos);
         Block supportBlock = world.BlockAccessor.GetMostSolidBlock(finalPos.DownCopy());
 
@@ -252,7 +251,7 @@ public static class EntityBlockFallingPatch
         {
             world.BlockAccessor.SetBlock(block.BlockId, finalPos);
 
-            // Restore block-entity state at the new position
+            // Восстанавливаем данные блочного объекта на новой позиции
             if (be != null)
             {
                 BlockEntity newBe = world.BlockAccessor.GetBlockEntity(finalPos);
@@ -270,7 +269,7 @@ public static class EntityBlockFallingPatch
             return;
         }
 
-        // Nowhere valid to land — scatter items
+        // Непригодных мест нет — разбрасываем предметы
         SpawnDrops(world, finalPos, drops, be);
     }
 }

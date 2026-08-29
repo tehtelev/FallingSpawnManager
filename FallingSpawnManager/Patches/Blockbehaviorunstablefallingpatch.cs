@@ -1,21 +1,22 @@
 ﻿using HarmonyLib;
 using Vintagestory.API.Common;
-using Vintagestory.API.Common.Entities;
 using Vintagestory.API.MathTools;
-using Vintagestory.API.Server;
-using Vintagestory.API.Util;
 using Vintagestory.GameContent;
 
 namespace FallingSpawnManager.Patches;
 
+/// <summary>
+/// Перехватывает падение сыпучих блоков (песок, гравий и т. п.), чтобы спавнить
+/// сущность падающего блока через наш менеджер вместо прямого вызова оригинала.
+/// </summary>
 public static class BlockBehaviorUnstableFallingPatch
 {
-    // Поля из оригинального класса
+    // Доступ к приватным полям исходного класса через FieldRef — обращение без оверхеда
     private static readonly AccessTools.FieldRef<BlockBehaviorUnstableFalling, AssetLocation> _fallSoundRef =
         AccessTools.FieldRefAccess<BlockBehaviorUnstableFalling, AssetLocation>("fallSound");
+
     private static readonly AccessTools.FieldRef<BlockBehaviorUnstableFalling, float> _impactDamageMulRef =
         AccessTools.FieldRefAccess<BlockBehaviorUnstableFalling, float>("impactDamageMul");
-
 
     private static readonly AccessTools.FieldRef<BlockBehaviorUnstableFalling, AssetLocation> _variantAfterFalling =
         AccessTools.FieldRefAccess<BlockBehaviorUnstableFalling, AssetLocation>("variantAfterFalling");
@@ -32,11 +33,11 @@ public static class BlockBehaviorUnstableFallingPatch
     {
         var fsm = world.Api.ModLoader.GetModSystem<FallingSpawnManager>();
         if (fsm == null)
-            return true; // если менеджер не загружен, пусть работает оригинал
+            return true; // менеджера нет — даём отработать оригинальному коду
 
 
         Block block = world.BlockAccessor.GetBlock(ourPos);
-        
+
         if (_variantAfterFalling(__instance) != (AssetLocation)null)
             block = world.BlockAccessor.GetBlock(_variantAfterFalling(__instance));
 
@@ -44,7 +45,7 @@ public static class BlockBehaviorUnstableFallingPatch
 
 
 
-        // Заменяем спавн на вызов нашего менеджера
+        // Вместо спавна сущности просим менеджер забрать заявку на падение
         fsm.RequestSpawn(
             block,
             be,
@@ -57,8 +58,8 @@ public static class BlockBehaviorUnstableFallingPatch
             positionOffset: null
         );
 
-        return false;
+        return false; // тело оригинального метода больше не выполняется
     }
 
-  
+
 }
