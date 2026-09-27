@@ -38,17 +38,28 @@ namespace FallingSpawnManager
         // Общее число загруженных сущностей EntityBlockFalling на сервере
         private static int totalFallingBlocks = 0;
 
-        // Очередь заявок на спавн сущностей, которые ждут свободного слота
-        private static Queue<SpawnRequest> requestQueue = new Queue<SpawnRequest>();
+        // Заявки на спавн сущностей, которые ждут свободного слота.
+        // FIX (по просьбе игроков): раньше это был Queue<SpawnRequest> — строгий FIFO,
+        // из-за чего порядок обвала в точности повторял порядок, в котором движок
+        // прогонял OnNeighbourBlockChange по позициям (обычно последовательный проход
+        // ряд за рядом) — визуально выглядело как predictable "волна". Список + случайная
+        // выборка (см. PopRandom ниже) убирают эту предсказуемость, сохраняя O(1) на
+        // извлечение через приём "поменять с последним и убрать последний".
+        private static List<SpawnRequest> requestQueue = new List<SpawnRequest>();
 
         // FIX: отдельная очередь для заявок на мгновенную симуляцию (когда игрока рядом нет).
         // Раньше такие заявки обрабатывались синхронно и немедленно внутри RequestSpawn.
-        private static Queue<SpawnRequest> instantQueue = new Queue<SpawnRequest>();
+        private static List<SpawnRequest> instantQueue = new List<SpawnRequest>();
+
+        // Общий генератор случайных чисел для выбора следующей заявки на обработку.
+        // Доступ только из серверного тика (однопоточно), поэтому обычный Random безопасен.
+        private static readonly Random _rng = new Random();
+
 
         // FIX: сколько мгновенных симуляций разрешено прогонять за один тик менеджера.
         // Ограничивает нагрузку на главный поток при массовых обрушениях вне зоны видимости
-        // игроков. Значение можно вынести в конфиг, если понадобится тонкая настройка.
-        private const int maxInstantPerTick = 100;
+        // игроков. Теперь настраивается через конфиг (см. FSMConfig.MaxInstantPerTick).
+        public static int maxInstantPerTick;
 
         // Позиции с уже повешенной заявкой — чтобы не дублировать спавн.
         // FIX: теперь сюда попадают позиции из ОБЕИХ очередей (requestQueue и instantQueue),
@@ -70,12 +81,27 @@ namespace FallingSpawnManager
         // Максимальное число падающих блоков
         public static int maxFallingLimit;
 
+
+        // Запуск только на стороне сервера, клиенту мод не нужен
         public override bool ShouldLoad(EnumAppSide forSide)
         {
             return forSide == EnumAppSide.Server;
         }
 
-
+        /// <summary>
+        /// Достаёт случайный элемент из списка за O(1): меняет местами со последним
+        /// и удаляет последний. Порядок оставшихся элементов при этом не сохраняется —
+        /// но нам порядок и не нужен, это и есть весь смысл.
+        /// </summary>
+        private static SpawnRequest PopRandom(List<SpawnRequest> list)
+        {
+            int index = _rng.Next(list.Count);
+            SpawnRequest picked = list[index];
+            int lastIndex = list.Count - 1;
+            list[index] = list[lastIndex];
+            list.RemoveAt(lastIndex);
+            return picked;
+        }
 
 
         /// <summary>
@@ -90,6 +116,11 @@ namespace FallingSpawnManager
 
             // Обрезаем значение до валидного диапазона
             maxFallingLimit = Math.Clamp(_config.MaxFallingLimit, 10, 10000);
+
+            // FIX: MaxInstantPerTick теперь настраивается из конфига (по умолчанию 100).
+            // Нижняя граница 1 — совсем без троттлинга (0) вернуло бы старое поведение
+            // "выполнить всё разом", которое и вызывало лаг; верхнюю берём с запасом.
+            maxInstantPerTick = Math.Clamp(_config.MaxInstantPerTick, 1, 10000);
         }
 
 
@@ -214,7 +245,7 @@ namespace FallingSpawnManager
 
             while (totalFallingBlocks < maxFallingLimit && requestQueue.Count > 0)
             {
-                request = requestQueue.Dequeue();
+                request = PopRandom(requestQueue);
                 pendingPositions.Remove(request.InitialPos);
 
                 // Проверяем, что блок на исходной позиции не сменился за время ожидания в очереди
@@ -238,9 +269,10 @@ namespace FallingSpawnManager
                         continue;
                     }
 
-                    // Возвращаем заявку в конец очереди ещё раз
+                    // Возвращаем заявку обратно в список ещё раз (порядок неважен —
+                    // в следующий раз она снова будет выбрана случайно)
                     pendingPositions.Add(request.InitialPos);
-                    requestQueue.Enqueue(request);
+                    requestQueue.Add(request);
                     continue;
                 }
 
@@ -271,7 +303,7 @@ namespace FallingSpawnManager
 
             while (processed < maxInstantPerTick && instantQueue.Count > 0)
             {
-                var request = instantQueue.Dequeue();
+                var request = PopRandom(instantQueue);
 
                 // Снимаем guard сразу при извлечении из очереди — с этого момента
                 // повторная заявка на ту же позицию (если вдруг придёт) будет
@@ -351,13 +383,13 @@ namespace FallingSpawnManager
             {
                 // FIX: раньше здесь стоял прямой синхронный вызов InstantFallSimulation(...).
                 // Теперь заявка просто уходит в instantQueue и будет обработана порциями
-                // в ProcessInstantQueue — по maxInstantPerTick штук за тик.
-                instantQueue.Enqueue(request);
+                // в ProcessInstantQueue — по maxInstantPerTick штук за тик, в случайном порядке.
+                instantQueue.Add(request);
                 return;
             }
 
-            // Игрок рядом — ставим заявку в очередь на полное создание сущности
-            requestQueue.Enqueue(request);
+            // Игрок рядом — ставим заявку в список на полное создание сущности
+            requestQueue.Add(request);
         }
 
         public override void Dispose()
@@ -413,5 +445,10 @@ namespace FallingSpawnManager
     public class FSMConfig
     {
         public int MaxFallingLimit = 500;
+
+        // FIX: сколько мгновенных симуляций падения (для блоков вне зоны видимости
+        // игроков) разрешено прогонять за один тик менеджера. Раньше было жёстко
+        // зашито константой (20), теперь настраивается.
+        public int MaxInstantPerTick = 100;
     }
 }
