@@ -17,6 +17,18 @@ namespace FallingSpawnManager
     /// Серверный менеджер спавна падающих блоков.
     /// Ограничивает число одновременно существующих EntityBlockFalling, ставит заявки
     /// в очередь и прогоняет мгновенную симуляцию для блоков за пределами видимости игроков.
+    ///
+    /// FIX: мгновенная симуляция (InstantFallSimulation) раньше выполнялась синхронно
+    /// прямо внутри RequestSpawn, без какого-либо троттлинга и без защиты от повторной
+    /// обработки одной и той же позиции. При массовом обрушении (например, большого
+    /// прямоугольника снега вне трекинг-радиуса игрока) это давало каскад синхронных
+    /// SetBlock/ExchangeBlock вызовов, триггерящих соседние обрушения в том же кадре,
+    /// что забивало главный поток на десятки секунд и могло приводить к дублированию
+    /// блоков при повторном входе для одной позиции.
+    ///
+    /// Теперь мгновенные заявки тоже идут через очередь с лимитом на тик (instantQueue /
+    /// maxInstantPerTick), а pendingPositions используется как guard для ОБЕИХ веток —
+    /// и для очереди сущностей, и для мгновенной очереди.
     /// </summary>
     public class FallingSpawnManager : ModSystem
     {
@@ -26,10 +38,22 @@ namespace FallingSpawnManager
         // Общее число загруженных сущностей EntityBlockFalling на сервере
         private static int totalFallingBlocks = 0;
 
-        // Очередь заявок на спавн, которые ждут свободного слота
+        // Очередь заявок на спавн сущностей, которые ждут свободного слота
         private static Queue<SpawnRequest> requestQueue = new Queue<SpawnRequest>();
 
-        // Позиции с уже повешенной заявкой — чтобы не дублировать спавн
+        // FIX: отдельная очередь для заявок на мгновенную симуляцию (когда игрока рядом нет).
+        // Раньше такие заявки обрабатывались синхронно и немедленно внутри RequestSpawn.
+        private static Queue<SpawnRequest> instantQueue = new Queue<SpawnRequest>();
+
+        // FIX: сколько мгновенных симуляций разрешено прогонять за один тик менеджера.
+        // Ограничивает нагрузку на главный поток при массовых обрушениях вне зоны видимости
+        // игроков. Значение можно вынести в конфиг, если понадобится тонкая настройка.
+        private const int maxInstantPerTick = 100;
+
+        // Позиции с уже повешенной заявкой — чтобы не дублировать спавн.
+        // FIX: теперь сюда попадают позиции из ОБЕИХ очередей (requestQueue и instantQueue),
+        // а не только из requestQueue, как было раньше. Это и есть guard от реентерабельной
+        // обработки одной и той же позиции, которая, судя по всему, приводила к дюпу блоков.
         private static HashSet<BlockPos> pendingPositions = new HashSet<BlockPos>();
 
         private static ICoreServerAPI sapi;
@@ -89,6 +113,16 @@ namespace FallingSpawnManager
                 harmony.Patch(tickMethod, postfix: new HarmonyMethod(typeof(EntityBlockFallingPatch), nameof(EntityBlockFallingPatch.EntityBlockFalling_OnGameTick_Postfix)));
             else
                 api.Logger.Error("OnGameTick not found");
+
+            // FIX: EntityBlockFalling.OnEntityDespawn — нужен, чтобы чистить запись в
+            // ConcurrentDictionary<long, ExtraData> (замена ConditionalWeakTable), иначе
+            // это была бы утечка памяти на каждую упавшую сущность.
+            var despawnMethod = AccessTools.Method(typeof(EntityBlockFalling), "OnEntityDespawn",
+                new[] { typeof(EntityDespawnData) });
+            if (despawnMethod != null)
+                harmony.Patch(despawnMethod, postfix: new HarmonyMethod(typeof(EntityBlockFallingPatch), nameof(EntityBlockFallingPatch.EntityBlockFalling_OnEntityDespawn_Postfix)));
+            else
+                api.Logger.Error("OnEntityDespawn not found");
 
             // BlockBehaviorUnstableRock.collapseLayer
             var collapseMethod = AccessTools.Method(typeof(BlockBehaviorUnstableRock), "collapseLayer",
@@ -160,14 +194,23 @@ namespace FallingSpawnManager
         }
 
         /// <summary>
-        /// Обрабатываем очередь спавна каждый тик. Спавним столько сущностей, сколько позволяет лимит.
+        /// Обрабатываем очереди спавна каждый тик:
+        ///   1) очередь сущностей — как и раньше, ограничена maxFallingLimit;
+        ///   2) FIX: очередь мгновенных симуляций — ограничена maxInstantPerTick,
+        ///      чтобы массовое обрушение вне зоны видимости игроков размазывалось
+        ///      по многим тикам, а не выполнялось одним синхронным ударом.
         /// </summary>
         private void OnGameTick(float dt)
+        {
+            ProcessEntityQueue();
+            ProcessInstantQueue();
+        }
+
+        private void ProcessEntityQueue()
         {
             SpawnRequest request;
             Block block;
             Entity existing;
-            EntityBlockFalling entityBf;
 
             while (totalFallingBlocks < maxFallingLimit && requestQueue.Count > 0)
             {
@@ -202,7 +245,7 @@ namespace FallingSpawnManager
                 }
 
                 // Создаём сущность и применяем смещение позиции, если оно задано
-                entityBf = new EntityBlockFalling(
+                var entityBf = new EntityBlockFalling(
                     request.Block, request.BlockEntity, request.InitialPos,
                     request.FallSound, request.ImpactDamageMul,
                     request.CanFallSideways, request.DustIntensity)
@@ -221,19 +264,61 @@ namespace FallingSpawnManager
             }
         }
 
+        // FIX: новый метод — обработка очереди мгновенных симуляций с лимитом на тик.
+        private void ProcessInstantQueue()
+        {
+            int processed = 0;
+
+            while (processed < maxInstantPerTick && instantQueue.Count > 0)
+            {
+                var request = instantQueue.Dequeue();
+
+                // Снимаем guard сразу при извлечении из очереди — с этого момента
+                // повторная заявка на ту же позицию (если вдруг придёт) будет
+                // обработана заново, а не проигнорирована навсегда.
+                pendingPositions.Remove(request.InitialPos);
+
+                // Блок на исходной позиции мог измениться, пока заявка ждала в очереди
+                // (например, игрок успел что-то там сломать/поставить, или структура
+                // уже обвалилась от соседнего срабатывания). SimulateInstantFall и сам
+                // делает похожую проверку, но делаем её и здесь, чтобы не тратить время
+                // на GetDrops и не звать симуляцию впустую.
+                Block currentBlock = sapi.World.BlockAccessor.GetBlock(request.InitialPos);
+                if (currentBlock == null || currentBlock.Id == 0 || currentBlock != request.Block)
+                {
+                    processed++;
+                    continue;
+                }
+
+                var drops = request.Block.GetDrops(sapi.World, request.InitialPos, null);
+                EntityBlockFallingPatch.SimulateInstantFall(
+                    sapi.World, request.Block, request.BlockEntity,
+                    request.InitialPos, drops, request.DoRemoveBlock);
+
+                processed++;
+            }
+        }
+
         /// <summary>
         /// Просит блок упасть.
-        /// Если игрок рядом — создаёт сущность (в очередь, если достигнут лимит).
-        /// Если никого нет — прогоняет мгновенную симуляцию без создания сущности.
+        /// Если игрок рядом — создаёт заявку на спавн сущности (в очередь, если достигнут лимит).
+        /// Если никого нет — FIX: ставит заявку в очередь мгновенной симуляции вместо
+        /// немедленного синхронного выполнения.
         /// </summary>
         public void RequestSpawn(Block block, BlockEntity be, BlockPos initialPos,
                                  AssetLocation fallSound, float impactDamageMul,
                                  bool canFallSideways, float dustIntensity,
                                  bool doRemoveBlock = true, Vec3d positionOffset = null)
         {
-            // Пропускаем дубликаты — для этой позиции уже есть заявка
+            // Пропускаем дубликаты — для этой позиции уже есть заявка в ЛЮБОЙ из очередей.
+            // FIX: раньше pendingPositions защищал только путь через requestQueue; мгновенный
+            // путь не проверялся и не регистрировался вообще, что и открывало окно для
+            // реентерабельной обработки одной и той же позиции (каскад через
+            // OnNeighbourBlockChange соседей внутри SetBlock/ExchangeBlock).
             if (pendingPositions.Contains(initialPos))
                 return;
+
+            pendingPositions.Add(initialPos);
 
             // Проверяем, есть ли игрок внутри activeRange
             bool hasPlayerNearby = false;
@@ -249,17 +334,7 @@ namespace FallingSpawnManager
                 }
             }
 
-            if (!hasPlayerNearby)
-            {
-                // Игроков рядом нет — сущность создавать не надо, прогоняем мгновенную симуляцию
-                InstantFallSimulation(block, be, initialPos, fallSound, impactDamageMul,
-                                      canFallSideways, dustIntensity, doRemoveBlock, positionOffset);
-                return;
-            }
-
-            // Игрок рядом — ставим заявку в очередь на полное создание сущности
-            pendingPositions.Add(initialPos);
-            requestQueue.Enqueue(new SpawnRequest
+            var request = new SpawnRequest
             {
                 Block = block,
                 BlockEntity = be,
@@ -270,26 +345,26 @@ namespace FallingSpawnManager
                 DustIntensity = dustIntensity,
                 DoRemoveBlock = doRemoveBlock,
                 PositionOffset = positionOffset ?? Vec3d.Zero
-            });
-        }
+            };
 
-        /// <summary>
-        /// Простой оберточный метод: берёт дропы и передаёт симуляцию в статический метод EntityBlockFalling.
-        /// </summary>
-        private void InstantFallSimulation(Block block, BlockEntity be, BlockPos initialPos,
-                                           AssetLocation fallSound, float impactDamageMul,
-                                           bool canFallSideways, float dustIntensity,
-                                           bool doRemoveBlock, Vec3d positionOffset)
-        {
-            var drops = block.GetDrops(sapi.World, initialPos, null);
-            EntityBlockFallingPatch.SimulateInstantFall(sapi.World, block, be, initialPos, drops, doRemoveBlock);
-        }
+            if (!hasPlayerNearby)
+            {
+                // FIX: раньше здесь стоял прямой синхронный вызов InstantFallSimulation(...).
+                // Теперь заявка просто уходит в instantQueue и будет обработана порциями
+                // в ProcessInstantQueue — по maxInstantPerTick штук за тик.
+                instantQueue.Enqueue(request);
+                return;
+            }
 
+            // Игрок рядом — ставим заявку в очередь на полное создание сущности
+            requestQueue.Enqueue(request);
+        }
 
         public override void Dispose()
         {
-            // При выгрузке мода чистим очередь и отвязываем события, чтобы не держать ссылки на объекты мира
+            // При выгрузке мода чистим очереди и отвязываем события, чтобы не держать ссылки на объекты мира
             requestQueue?.Clear();
+            instantQueue?.Clear(); // FIX: чистим и новую очередь тоже
             pendingPositions?.Clear();
             totalFallingBlocks = 0;
             if (sapi != null)
@@ -303,10 +378,12 @@ namespace FallingSpawnManager
             harmony?.UnpatchAll("fallingspawnmanager");
 
             _initialized = false; // для повторного старта после релоада
+
         }
 
         /// <summary>
-        /// Данные одной заявки на спавн в очереди.
+        /// Данные одной заявки на спавн в очереди (используется и для requestQueue,
+        /// и для instantQueue — RetryCount актуален только для requestQueue).
         /// </summary>
         private struct SpawnRequest
         {
@@ -321,6 +398,7 @@ namespace FallingSpawnManager
             public Vec3d PositionOffset;
 
             // Сколько раз заявку уже возвращали в очередь из-за занятой позиции
+            // (используется только в requestQueue / ProcessEntityQueue)
             public int RetryCount;
         }
 
