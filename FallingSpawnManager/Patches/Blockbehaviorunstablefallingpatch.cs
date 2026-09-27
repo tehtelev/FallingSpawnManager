@@ -11,7 +11,7 @@ namespace FallingSpawnManager.Patches;
 /// </summary>
 public static class BlockBehaviorUnstableFallingPatch
 {
-    // Доступ к приватным полям исходного класса через FieldRef — обращение без оверхеда
+    // Доступ к приватным полям исходного класса через FieldRef, обращение без оверхеда
     private static readonly AccessTools.FieldRef<BlockBehaviorUnstableFalling, AssetLocation> _fallSoundRef =
         AccessTools.FieldRefAccess<BlockBehaviorUnstableFalling, AssetLocation>("fallSound");
 
@@ -33,7 +33,7 @@ public static class BlockBehaviorUnstableFallingPatch
     {
         var fsm = world.Api.ModLoader.GetModSystem<FallingSpawnManager>();
         if (fsm == null)
-            return true; // менеджера нет — даём отработать оригинальному коду
+            return true; // менеджера нет, даём отработать оригинальному коду
 
 
         Block block = world.BlockAccessor.GetBlock(ourPos);
@@ -43,7 +43,16 @@ public static class BlockBehaviorUnstableFallingPatch
 
         BlockEntity be = world.BlockAccessor.GetBlockEntity(ourPos);
 
+        Block currentBlock = world.BlockAccessor.GetBlock(ourPos);
 
+        // Тот же чек, что в ванилле: блок на позиции уже не наш.
+        if (__instance.block != currentBlock)
+            return false;
+
+        // Ванильный FallingEntityAlreadyExists: если в мире уже есть EntityBlockFalling
+        // с этим initialPos, не плодим вторую. У нас есть O(1) версия этого в менеджере.
+        if (FallingSpawnManager.IsPositionActiveOrPending(ourPos))
+            return false;
 
         // Вместо спавна сущности просим менеджер забрать заявку на падение
         FallingSpawnManager.RequestSpawn(
