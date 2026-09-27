@@ -77,7 +77,7 @@ public static class BlockBehaviorUnstableRockPatch
             if (bh == null || fsm == null)
                 continue;
 
-            fsm.RequestSpawn(
+            FallingSpawnManager.RequestSpawn(
                 _collapsedBlockRef(bh),
                 world.BlockAccessor.GetBlockEntity(pos),
                 pos,

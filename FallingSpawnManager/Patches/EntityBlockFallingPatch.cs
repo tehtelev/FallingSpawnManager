@@ -13,23 +13,23 @@ using Vintagestory.GameContent;
 namespace FallingSpawnManager.Patches;
 
 /// <summary>
-/// Патчи Harmony для EntityBlockFalling:
+/// Патчи Harmony для EntityBlockFalling.
 ///   - В Initialize ставим AlwaysActive = true и нормализуем SimulationRange.
-///   - Периодически проверяем, не ушёл ли игрок рядом: если никого нет — блок
+///   - Периодически проверяем, не ушёл ли иг рядом: если никого нет, блок
 ///     падает мгновенно, а сущность уничтожается, чтобы не оставалось «фантомов».
 ///
 /// Статические SimulateInstantFall / SpawnDrops сделаны публичными, чтобы
 /// FallingSpawnManager (отдельный мод) мог их вызывать без рефлексии.
 ///
-/// FIX: ConditionalWeakTable&lt;EntityBlockFalling, ExtraData&gt; заменён на
-/// ConcurrentDictionary&lt;long, ExtraData&gt; по EntityId. ConditionalWeakTable
-/// берёт внутреннюю блокировку почти на каждый GetOrCreateValue и периодически
-/// сканирует таблицу на мёртвые слабые ссылки — при сотнях одновременно падающих
-/// сущностей (OnGameTick вызывается на каждую, каждый тик) это давало заметный
-/// own time именно на GetOrCreateValue (см. профиль DotTrace). Обычный словарь по
-/// long-ключу намного дешевле, а нужный нам жизненный цикл (когда чистить запись)
-/// у нас и так уже полностью прозрачен — сущность умирает через OnEntityDespawn,
-/// который мы теперь тоже патчим, чтобы убрать запись из словаря вручную.
+/// Состояние на каждый инстанс храним в ConcurrentDictionary&lt;long, ExtraData&gt;
+/// по EntityId вместо ConditionalWeakTable<EntityBlockFalling, ExtraData>. У
+/// ConditionalWeakTable есть внутренняя блокировка почти на каждый GetOrCreateValue,
+/// и он периодически сканирует таблицу на мёртные слабые ссылки. При сотнях
+/// одновременно падающих сущностей (OnGameTick вызывается на каждую, каждый тик)
+/// это давало заметный own time именно на GetOrCreateValue (см. профиль DotTrace).
+/// Словарь по ключу long намного дешевле, а жизненный цикл записи у нас уже
+/// полностью прозрачен: сущность умирает через OnEntityDespawn, который мы тоже
+/// патчим, чтобы убрать запись из словаря вручную.
 /// </summary>
 public static class EntityBlockFallingPatch
 {
@@ -53,33 +53,34 @@ public static class EntityBlockFallingPatch
         public long LastPlayerCheckMs;
     }
 
-    // FIX: было ConditionalWeakTable<EntityBlockFalling, ExtraData> — дорогой lock на
-    // каждый GetOrCreateValue. Теперь простой словарь по EntityId. ConcurrentDictionary,
-    // а не обычный Dictionary — на случай, если Initialize/Despawn когда-нибудь позовутся
-    // не строго из серверного тика (например, во время загрузки чанков в отдельном потоке).
-    // Запись обязательно чистится в OnEntityDespawn-постфиксе ниже — в отличие от
-    // ConditionalWeakTable, здесь это не произойдёт само по себе через GC.
+    // Состояние храним в ConcurrentDictionary&lt;long, ExtraData&gt; по EntityId вместо
+    // ConditionalWeakTable<EntityBlockFalling, ExtraData>. У ConditionalWeakTable есть
+    // дорогой lock на каждый GetOrCreateValue. ConcurrentDictionary выбран не просто как
+    // обычный Dictionary на случай, если Initialize/Despawn когда-нибудь позовутся не
+    // строго из серверного тика (например, во время загрузки чанков в отдельном потоке).
+    // Запись обязательно чистится в OnEntityDespawn-постфиксе ниже, в отличие от
+    // ConditionalWeakTable, где это произошло бы само по себе через GC.
     private static readonly ConcurrentDictionary<long, ExtraData> _extra = new();
 
     private const int PlayerCheckIntervalMs = 2000;
 
     // -------------------------------------------------------------------------
-    //  Патч 1 — Initialize
+    //  Патч 1 (Initialize)
     //
     //  Три правки в одном postfix (он выполняется ПОСЛЕ base.Initialize, поэтому
     //  наши побеждают):
     //
     //  a) AlwaysActive = true
     //     Проще и дешевле, чем патчить геттер базового класса: просто пишем свойство
-    //     напрямую — бэкинг-поле задаётся один раз в момент спавна.
+    //     напрямую, бэкинг-поле задаётся один раз в момент спавна.
     //
     //  b) SimulationRange = GlobalConstants.DefaultSimulationRange
     //     В оригинале пишется (int)(0.75f * DefaultSimulationRange). Полный дефолтный
     //     диапазон физика прорабатывает на том же расстоянии, что сервер уже следит за
-    //     сущностями — лишних затрат нет, зато проверка близости игрока теперь срабатывает,
+    //     сущностями, лишних затрат нет, проверка близости игрока теперь срабатывает,
     //     когда все игроки покидают область.
     //
-    //  c) FIX: заранее создаём запись в _extra, а не полагаемся на GetOrAdd в OnGameTick.
+    //  c) Заранее создаём запись в _extra, а не полагаемся на GetOrAdd в OnGameTick.
     //     Это разовая операция на спавн сущности, а не на каждый тик.
     // -------------------------------------------------------------------------
 
@@ -93,16 +94,16 @@ public static class EntityBlockFallingPatch
         __instance.AlwaysActive = true;
         __instance.SimulationRange = GlobalConstants.DefaultSimulationRange;
 
-        // FIX: регистрируем сущность в словаре один раз при инициализации,
+        // Регистрируем сущность в словаре один раз при инициализации,
         // а не на каждом тике через GetOrCreateValue/GetOrAdd.
         _extra[__instance.EntityId] = new ExtraData();
     }
 
     // -------------------------------------------------------------------------
-    //  FIX: новый патч — OnEntityDespawn: убираем запись из словаря, когда сущность
-    //  умирает (упала, была убрана менеджером, выгружен чанк и т. п.). Без этого
-    //  ConcurrentDictionary был бы утечкой памяти на каждую упавшую сущность —
-    //  в отличие от ConditionalWeakTable, он сам за собой не убирает.
+    //  Патч OnEntityDespawn: убираем запись из словаря, когда сущность умирает
+    //  (упала, была убрана менеджером, выгружен чанк и т. п.). Без этого
+    //  ConcurrentDictionary был бы утечки памяти на каждой упавшей сущности,
+    //  в отличие от ConditionalWeakTable, где он сам за собой не убирает.
     // -------------------------------------------------------------------------
 
     [HarmonyPostfix]
@@ -115,9 +116,9 @@ public static class EntityBlockFallingPatch
     }
 
     // -------------------------------------------------------------------------
-    //  Патч 2 — OnGameTick: проверка близости игрока
+    //  Патч 2 (OnGameTick): проверка близости игрока
     //
-    //  Раз в PlayerCheckIntervalMs мс проверяем, кто-то всё ещё рядом. Если нет —
+    //  Раз в PlayerCheckIntervalMs мс проверяем, кто-то всё ещё рядом. Если никого нет,
     //  прогоняем мгновенное падение и убиваем сущность. Так блоки не накапливаются
     //  в загруженных, но безлюдных чанках.
     //
@@ -133,17 +134,17 @@ public static class EntityBlockFallingPatch
         float dt)
     {
 
-        // Только сервер; пропускаем мёртвые или уже обработанные сущности
+        // Только сервер; пропускаем мёртые или уже обработанные сущности
         if (__instance.Api?.Side != EnumAppSide.Server) return;
         if (!__instance.Alive) return;
         if (_fallHandledRef(__instance)) return;
 
-        // FIX: было _extra.GetOrCreateValue(__instance) — блокировка на каждый тик.
-        // Теперь обычный TryGetValue по long-ключу без lock'ов ConditionalWeakTable.
+        // Раньше было _extra.GetOrCreateValue(__instance), что давало блокировку на
+        // каждый тик. Теперь обычный TryGetValue по ключу long без lock'ов ConditionalWeakTable.
         // Запись должна уже существовать (создана в Initialize), но на всякий случай
-        // (например, если сущность была создана до применения патча Initialize, либо
-        // при горячей перезагрузке мода) подстраховываемся через GetOrAdd — этот путь
-        // не должен быть горячим, поэтому лишний GetOrAdd тут не страшен.
+        // (например, если сущность была создана до применения патча Initialize либо при
+        // горячей перезагрузке мода) подстраховываемся через GetOrAdd. Этот путь не должен
+        // быть горячим, поэтому лишний GetOrAdd тут не страшен.
         ExtraData data = _extra.GetOrAdd(__instance.EntityId, _ => new ExtraData());
 
         long now = __instance.Api.World.ElapsedMilliseconds;
@@ -177,7 +178,7 @@ public static class EntityBlockFallingPatch
 
     private static void FallNow(EntityBlockFalling entity)
     {
-        // Защита от повторного входа — OnFallToGround мог поставить этот флаг в тот же тик
+        // Защита от повторного входа, OnFallToGround мог поставить этот флаг в тот же тик
         if (_fallHandledRef(entity)) return;
         _fallHandledRef(entity) = true;
 
@@ -227,15 +228,15 @@ public static class EntityBlockFallingPatch
     /// Идёт вниз, пока не найдёт твёрдую поверхность, затем либо ставит блок, либо
     /// выбрасывает предметы.  Используется для блоков за пределами видимости игроков.
     /// </summary>
-    /// <param name="world">Доступ к миру.</param>
-    /// <param name="block">Падающий блок.</param>
-    /// <param name="be">Блочный объект, прикреплённый к блоку (может быть null).</param>
-    /// <param name="startPos">Позиция, с которой блок упал.</param>
-    /// <param name="drops">Заранее вычисленные предметы (могут быть null).</param>
+    /// <param name="world">Доступ к миру.</param</param>
+    /// <param name="block">Падающий блок.</param</param>
+    /// <param name="be">Блочный объект, прикреплённый к блоку (может be null).</param</param>
+    /// <param name="startPos">Позиция, с которой блок упал.</param</param>
+    /// <param name="drops">Заранее вычисленные предметы (могут be null).</param</param>
     /// <param name="doRemoveBlock">
-    ///     Если true — сначала удаляет блок из <paramref name="startPos"/> (с проверкой
+    ///     Если true, сначала удаляет блок из <paramref name="startPos"/> (с проверкой
     ///     корректности). Передавать false, если блок уже был удалён.
-    /// </param>
+    /// </param</param>
     public static void SimulateInstantFall(
         IWorldAccessor world,
         Block block,
@@ -271,7 +272,7 @@ public static class EntityBlockFallingPatch
             BlockPos belowPos = finalPos.DownCopy();
             Block belowBlock = world.BlockAccessor.GetMostSolidBlock(belowPos);
 
-            // Даём целевому блоку обработать приземление (например, воронка, рыхлая земля)
+            // Даём целевому блоку обработать приземление (например, воронка, рхлая земля)
             if (belowBlock.CanAcceptFallOnto(world, belowPos, block, beTree))
             {
                 belowBlock.OnFallOnto(world, belowPos, block, beTree);
@@ -279,12 +280,12 @@ public static class EntityBlockFallingPatch
             }
 
             if (belowBlock.Replaceable >= 6000 || belowBlock.IsLiquid())
-                finalPos = belowPos;  // проходимый — продолжаем падать
+                finalPos = belowPos;  // проходимый, продолжаем падать
             else
-                break;               // твёрдый — останавливаемся
+                break;               // твёрдый, останавливаемся
         }
 
-        // Проверяем позицию приземления: под ней должна быть твёрдая опора, а в finalPos — свободное место
+        // Проверяем позицию приземления: под ней должна быть твёрдая опора, а в finalPos свободное место
         Block targetBlock = world.BlockAccessor.GetBlock(finalPos);
         Block supportBlock = world.BlockAccessor.GetMostSolidBlock(finalPos.DownCopy());
 
@@ -314,7 +315,7 @@ public static class EntityBlockFallingPatch
             return;
         }
 
-        // Непригодных мест нет — разбрасываем предметы
+        // Непригодных мест нет, разбрасываем предметы
         SpawnDrops(world, finalPos, drops, be);
     }
 }

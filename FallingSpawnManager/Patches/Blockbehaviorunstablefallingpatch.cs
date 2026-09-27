@@ -46,7 +46,7 @@ public static class BlockBehaviorUnstableFallingPatch
 
 
         // Вместо спавна сущности просим менеджер забрать заявку на падение
-        fsm.RequestSpawn(
+        FallingSpawnManager.RequestSpawn(
             block,
             be,
             ourPos,
