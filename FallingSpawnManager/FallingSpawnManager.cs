@@ -6,6 +6,7 @@ using System.Linq;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.Config;
+using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 using Vintagestory.GameContent;
@@ -328,99 +329,101 @@ namespace FallingSpawnManager
 		}
 
 		// Метод обработки очереди мгновенных симуляций с лимитом на тик.
-		private static void ProcessInstantQueue()
-		{
-			int processed = 0;
+        private static void ProcessInstantQueue()
+        {
+            int processed = 0;
 
-			while (processed < maxInstantPerTick && instantQueue.Count > 0)
-			{
-				var request = PopRandom(instantQueue);
+            while (processed < maxInstantPerTick && instantQueue.Count > 0)
+            {
+                var request = PopRandom(instantQueue);
 
-				// Снимаем guard сразу при извлечении из очереди, с этого момента
-				// повторная заявка на ту же позицию (если вдруг придёт) будет
-				// обработана заново, а не проигнорирована навсегда.
-				pendingPositions.Remove(request.InitialPos);
+                pendingPositions.Remove(request.InitialPos);
 
-				// Блок на исходной позиции мог измениться, пока заявка ждала в очереди
-				// (например, игрок успел что-то там сломать/поставить, или структура
-				// уже обвалилась от соседнего срабатывания). SimulateInstantFall и сам
-				// делает похожую проверку, но делаем её и здесь, чтобы не тратить время
-				// на GetDrops и не звать симуляцию впустую.
-				Block currentBlock = sapi.World.BlockAccessor.GetBlock(request.InitialPos);
-				if (currentBlock == null || currentBlock.Id == 0 || currentBlock != request.Block)
-				{
-					processed++;
-					continue;
-				}
+                Block currentBlock = sapi.World.BlockAccessor.GetBlock(request.InitialPos);
+                if (currentBlock == null || currentBlock.Id == 0 || currentBlock != request.Block)
+                {
+                    processed++;
+                    continue;
+                }
 
-				var drops = request.Block.GetDrops(sapi.World, request.InitialPos, null);
-				EntityBlockFallingPatch.SimulateInstantFall(
-					sapi.World, request.Block, request.BlockEntity,
-					request.InitialPos, drops, request.DoRemoveBlock);
+                var drops = request.Block.GetDrops(sapi.World, request.InitialPos, null);
 
-				processed++;
-			}
-		}
+                // Передаём СНИМОК (BlockEntityTree), а не живой BE. Живой BE идёт вторым
+                // аргументом только для DropContents, если блок не сможет лечь на место.
+                EntityBlockFallingPatch.SimulateInstantFall(
+                    sapi.World,
+                    request.Block,
+                    request.BlockEntity,
+                    request.BlockEntityTree,
+                    request.InitialPos,
+                    drops,
+                    request.DoRemoveBlock);
+
+                processed++;
+            }
+        }
 
 		/// <summary>
 		/// Просит блок упасть.
 		/// Если игрок рядом, создаёт заявку на спавн сущности (в очередь, если достигнут лимит).
 		/// Если никого рядом, ставит заявку в очередь мгновенной симуляции.
 		/// </summary>
-		public static void RequestSpawn(Block block, BlockEntity be, BlockPos initialPos,
-								 AssetLocation fallSound, float impactDamageMul,
-								 bool canFallSideways, float dustIntensity,
-								 bool doRemoveBlock = true, Vec3d positionOffset = null)
-		{
-			// Пропускаем дубликаты, если для этой позиции уже есть заявка в ЛЮБОЙ из очередей.
-			// pendingPositions защищает обе ветки: и requestQueue, и instantQueue. Раньше
-			// мгновенный путь не проверялся и не регистрировался вообще, что открывало окно
-			// для реентерабельной обработки одной и той же позиции (каскад через
-			// OnNeighbourBlockChange соседей внутри SetBlock/ExchangeBlock).
-			if (pendingPositions.Contains(initialPos))
-				return;
+        public static void RequestSpawn(Block block, BlockEntity be, BlockPos initialPos,
+            AssetLocation fallSound, float impactDamageMul,
+            bool canFallSideways, float dustIntensity,
+            bool doRemoveBlock = true, Vec3d positionOffset = null)
+        {
+            if (pendingPositions.Contains(initialPos))
+                return;
 
-			pendingPositions.Add(initialPos);
+            pendingPositions.Add(initialPos);
 
-			// Проверяем, есть ли игрок внутри activeRange
-			bool hasPlayerNearby = false;
-			Vec3d posVec = initialPos.ToVec3d();
-			EntityPlayer eplr;
-			foreach (IPlayer player in sapi.World.AllOnlinePlayers)
-			{
-				eplr = player.Entity;
-				if (eplr != null && eplr.Pos.InRangeOf(posVec, activeRange * activeRange, activeRange))
-				{
-					hasPlayerNearby = true;
-					break;
-				}
-			}
+            bool hasPlayerNearby = false;
+            Vec3d posVec = initialPos.ToVec3d();
+            EntityPlayer eplr;
+            foreach (IPlayer player in sapi.World.AllOnlinePlayers)
+            {
+                eplr = player.Entity;
+                if (eplr != null && eplr.Pos.InRangeOf(posVec, activeRange * activeRange, activeRange))
+                {
+                    hasPlayerNearby = true;
+                    break;
+                }
+            }
 
-			var request = new SpawnRequest
-			{
-				Block = block,
-				BlockEntity = be,
-				InitialPos = initialPos.Copy(),
-				FallSound = fallSound,
-				ImpactDamageMul = impactDamageMul,
-				CanFallSideways = canFallSideways,
-				DustIntensity = dustIntensity,
-				DoRemoveBlock = doRemoveBlock,
-				PositionOffset = positionOffset ?? Vec3d.Zero
-			};
+            // Снимок BE делаем ЗДЕСЬ, пока блок ещё не снят и инвентарь ещё в исходном
+            // состоянии. Для instant-пути это критично: там нет EntityBlockFalling.Initialize,
+            // который бы сделал снимок сам, а живой BE к моменту обработки очереди
+            // может быть уже изменён/удалён (см. BlockEntityCoalPile.TryPartialCollapse).
+            TreeAttribute beTree = null;
+            if (be != null)
+            {
+                beTree = new TreeAttribute();
+                be.ToTreeAttributes(beTree);
+            }
 
-			if (!hasPlayerNearby)
-			{
-				// Раньше здесь стоял прямой синхронный вызов InstantFallSimulation(...).
-				// Теперь заявка просто уходит в instantQueue и будет обработана порциями
-				// в ProcessInstantQueue по maxInstantPerTick штук за тик, в случайном порядке.
-				instantQueue.Add(request);
-				return;
-			}
+            var request = new SpawnRequest
+            {
+                Block = block,
+                BlockEntity = be,
+                BlockEntityTree = beTree,
+                InitialPos = initialPos.Copy(),
+                FallSound = fallSound,
+                ImpactDamageMul = impactDamageMul,
+                CanFallSideways = canFallSideways,
+                DustIntensity = dustIntensity,
+                DoRemoveBlock = doRemoveBlock,
+                PositionOffset = positionOffset ?? Vec3d.Zero
+            };
 
-			// Игрок рядом, ставим заявку в список на полное создание сущности
-			requestQueue.Add(request);
-		}
+            if (!hasPlayerNearby)
+            {
+                instantQueue.Add(request);
+                return;
+            }
+
+            requestQueue.Add(request);
+        }
 
 		public override void Dispose()
 		{
@@ -448,27 +451,34 @@ namespace FallingSpawnManager
 		/// Данные одной заявки на спавн в очереди (используется и для requestQueue,
 		/// и для instantQueue. RetryCount актуален только для requestQueue).
 		/// </summary>
-		private struct SpawnRequest
-		{
-			public Block Block;
-			public BlockEntity BlockEntity;
-			public BlockPos InitialPos;
-			public AssetLocation FallSound;
-			public float ImpactDamageMul;
-			public bool CanFallSideways;
-			public float DustIntensity;
-			public bool DoRemoveBlock;
-			public Vec3d PositionOffset;
+        private struct SpawnRequest
+        {
+            public Block Block;
+            public BlockEntity BlockEntity;
 
-			// Сколько раз заявку уже возвращали в очередь из-за занятой позиции
-			// (используется только в requestQueue / ProcessEntityQueue)
-			public int RetryCount;
-		}
+            // Снимок атрибутов BE, сделанный в момент RequestSpawn.
+            // Нужен для instant-пути: пока заявка ждёт в очереди, живой BE мог
+            // измениться или умереть, а OnFallOnto/FromTreeAttributes нужен
+            // именно тот снимок, что был при постановке заявки.
+            public TreeAttribute BlockEntityTree;
+
+            public BlockPos InitialPos;
+            public AssetLocation FallSound;
+            public float ImpactDamageMul;
+            public bool CanFallSideways;
+            public float DustIntensity;
+            public bool DoRemoveBlock;
+            public Vec3d PositionOffset;
+
+            // Сколько раз заявку уже возвращали в очередь из-за занятой позиции
+            // (используется только в requestQueue / ProcessEntityQueue)
+            public int RetryCount;
+        }
 
 
 
 	}
-
+    
 
 	/// <summary>
 	/// Конфигурация мода

@@ -226,11 +226,11 @@ public static class EntityBlockFallingPatch
         SimulateInstantFall(
             entity.Api.World,
             entity.Block,
-            entity.removedBlockentity,
+            entity.removedBlockentity,        // живой BE нужен только для DropContents контейнера
+            entity.blockEntityAttributes,     // снимок, сделанный в EntityBlockFalling.Initialize
             atPos,
             drops,
-            doRemoveBlock: false   // блок уже удалён при спавне сущности, не пытаемся удалить его снова
-        );
+            doRemoveBlock: false);            // блок уже удалён при спавне сущности
 
         entity.Die(EnumDespawnReason.Removed);
     }
@@ -265,11 +265,16 @@ public static class EntityBlockFallingPatch
     /// <summary>
     /// Мгновенно проходит траекторию падения без создания сущности.
     /// Идёт вниз, пока не найдёт твёрдую поверхность, затем либо ставит блок, либо
-    /// выбрасывает предметы.  Используется для блоков за пределами видимости игроков.
+    /// выбрасывает предметы. Используется для блоков за пределами видимости игроков.
     /// </summary>
     /// <param name="world">Доступ к миру.</param>
     /// <param name="block">Падающий блок.</param>
-    /// <param name="be">Блочный объект, прикреплённый к блоку (может быть null).</param>
+    /// <param name="be">Живой блочный объект (используется только для IBlockEntityContainer.DropContents в конце). Может быть null.</param>
+    /// <param name="beTree">
+    ///     Снимок атрибутов BE, сделанный ДО того, как блок был снят/изменён
+    ///     (у EntityBlockFalling это blockEntityAttributes, у instant-заявок — снимок в RequestSpawn).
+    ///     Именно он уходит в CanAcceptFallOnto / OnFallOnto / FromTreeAttributes. Может быть null.
+    /// </param>
     /// <param name="startPos">Позиция, с которой блок упал.</param>
     /// <param name="drops">Заранее вычисленные предметы (могут быть null).</param>
     /// <param name="doRemoveBlock">
@@ -280,29 +285,19 @@ public static class EntityBlockFallingPatch
         IWorldAccessor world,
         Block block,
         BlockEntity be,
+        TreeAttribute beTree,
         BlockPos startPos,
         ItemStack[] drops,
         bool doRemoveBlock)
     {
         if (doRemoveBlock)
         {
-            // Проверка безопасности: блок мог измениться за время ожидания в очереди
             if (world.BlockAccessor.GetBlock(startPos) != block)
                 return;
             world.BlockAccessor.SetBlock(0, startPos);
         }
 
         BlockPos finalPos = startPos.Copy();
-
-        // Серилизуем блочный объект один раз, чтобы обработчики CanAcceptFallOnto / OnFallOnto
-        // могли осмотреть его данные.
-        TreeAttribute beTree = null;
-        if (be != null)
-        {
-            beTree = new TreeAttribute();
-            be.ToTreeAttributes(beTree);
-        }
-
         int worldHeight = world.BlockAccessor.MapSizeY;
 
         // Идём вниз по проходимым блокам (воздух, вода, листва и т. п.)
@@ -311,7 +306,9 @@ public static class EntityBlockFallingPatch
             BlockPos belowPos = finalPos.DownCopy();
             Block belowBlock = world.BlockAccessor.GetMostSolidBlock(belowPos);
 
-            // Даём целевому блоку обработать приземление (например, воронка, рыхлая земля)
+            // Даём целевому блоку обработать приземление (например, воронка, рыхлая земля).
+            // ВАЖНО: сюда идёт СНИМОК beTree, а не результат повторной сериализации живого BE —
+            // иначе, например, BlockEntityCoalPile.MergeWith получит пустой inventory и упадёт с NRE.
             if (belowBlock.CanAcceptFallOnto(world, belowPos, block, beTree))
             {
                 belowBlock.OnFallOnto(world, belowPos, block, beTree);
@@ -319,9 +316,9 @@ public static class EntityBlockFallingPatch
             }
 
             if (belowBlock.Replaceable >= 6000 || belowBlock.IsLiquid())
-                finalPos = belowPos;  // проходимый, продолжаем падать
+                finalPos = belowPos;
             else
-                break;               // твёрдый, останавливаемся
+                break;
         }
 
         // Проверяем позицию приземления: под ней должна быть твёрдая опора, а в finalPos свободное место
@@ -336,25 +333,26 @@ public static class EntityBlockFallingPatch
         {
             world.BlockAccessor.SetBlock(block.BlockId, finalPos);
 
-            // Восстанавливаем данные блочного объекта на новой позиции
-            if (be != null)
+            // Восстанавливаем данные блочного объекта на новой позиции из СНИМКА,
+            // а не из живого BE: живой BE к этому моменту может уже быть detached/пустым.
+            if (beTree != null)
             {
                 BlockEntity newBe = world.BlockAccessor.GetBlockEntity(finalPos);
                 if (newBe != null)
                 {
-                    TreeAttribute tree = new TreeAttribute();
-                    be.ToTreeAttributes(tree);
-                    tree.SetInt("posx", finalPos.X);
-                    tree.SetInt("posy", finalPos.InternalY);
-                    tree.SetInt("posz", finalPos.Z);
-                    newBe.FromTreeAttributes(tree, world);
+                    beTree.SetInt("posx", finalPos.X);
+                    beTree.SetInt("posy", finalPos.InternalY);
+                    beTree.SetInt("posz", finalPos.Z);
+                    newBe.FromTreeAttributes(beTree, world);
                 }
             }
 
             return;
         }
 
-        // Непригодных мест нет, разбрасываем предметы
+        // Подходящего места нет, разбрасываем предметы.
+        // Здесь живой be нужен только для DropContents контейнера — это соответствует
+        // ванильному EntityBlockFalling.DropItems.
         SpawnDrops(world, finalPos, drops, be);
     }
 
