@@ -69,6 +69,6 @@ public static class BlockBehaviorUnstableFallingPatch
 
         return false; // тело оригинального метода больше не выполняется
     }
-
+    
 
 }

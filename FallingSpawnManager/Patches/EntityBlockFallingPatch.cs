@@ -18,7 +18,7 @@ namespace FallingSpawnManager.Patches;
 ///   2) Периодически проверяем, не ушёл ли игрок рядом: если никого нет, блок
 ///      падает мгновенно, а сущность уничтожается, чтобы не оставалось «фантомов».
 ///   3) Сторожевой таймер против известного vanilla-бага "Falling block entity
-///      does not settle" (форум VS #5775): при массовом обвале падающие сущности
+///      does not settle" (форум VS #5775): при массовом obвале падающие сущности
 ///      могут скучиваться и физически застревать друг об друга, никогда не
 ///      приземляясь, даже когда игрок стоит рядом и смотрит на них. Если сущность
 ///      жива дольше stuckTimeoutMs (настраивается в конфиге) и всё ещё не
@@ -30,7 +30,7 @@ namespace FallingSpawnManager.Patches;
 /// ConditionalWeakTable&lt;EntityBlockFalling, ExtraData&gt; заменён на
 /// ConcurrentDictionary&lt;long, ExtraData&gt; по EntityId. ConditionalWeakTable
 /// берёт внутреннюю блокировку почти на каждый GetOrCreateValue и периодически
-/// сканирует таблицу на мёртвые слабые ссылки, при сотнях одновременно падающих
+/// сканирует таблицу на мёртные слабые ссылки, при сотнях одновременно падающих
 /// сущностей (OnGameTick вызывается на каждую, каждый тик) это давало заметный
 /// own time именно на GetOrCreateValue (см. профиль DotTrace). Обычный словарь по
 /// long-ключу намного дешевле, а нужный нам жизненный цикл (когда чистить запись)
@@ -65,7 +65,7 @@ public static class EntityBlockFallingPatch
 
     // Было ConditionalWeakTable<EntityBlockFalling, ExtraData>, дорогой lock на
     // каждый GetOrCreateValue. Теперь простой словарь по EntityId. ConcurrentDictionary,
-    // а не обычный Dictionary, на случай, если Initialize/Despawn когда-нибудь позовутся
+    // а не обычный Dictionary, на случай, если Initialize/Despawn когда-нибудь будут вызваны
     // не строго из серверного тика (например, во время загрузки чанков в отдельном потоке).
     // Запись обязательно чистится в постфиксе OnEntityDespawn ниже: в отличие от
     // ConditionalWeakTable, здесь это не произойдёт само по себе через GC.
@@ -132,7 +132,7 @@ public static class EntityBlockFallingPatch
     //  Патч 2: OnGameTick, проверка близости игрока
     //
     //  Раз в PlayerCheckIntervalMs мс проверяем, кто-то всё ещё рядом. Если нет,
-    //  прогоняем мгновенное падение и убиваем сущность. Так блоки не накапливаются
+    //  прогоняет мгновенное падение и убиваем сущность. Так блоки не накапливаются
     //  в загруженных, но безлюдных чанках.
     //
     //  Postfix вместо транспайлера держит патч простым и устойчивым к обновлениям игры.
@@ -142,22 +142,19 @@ public static class EntityBlockFallingPatch
 
     [HarmonyPostfix]
     [HarmonyPatch(typeof(EntityBlockFalling), "OnGameTick")]
-    public static void EntityBlockFalling_OnGameTick_Postfix(
-        EntityBlockFalling __instance,
-        float dt)
+    public static void EntityBlockFalling_OnGameTick_Postfix(EntityBlockFalling __instance, float dt)
     {
-
-        // Только сервер; пропускаем мёртвые или уже обработанные сущности
         if (__instance.Api?.Side != EnumAppSide.Server) return;
         if (!__instance.Alive) return;
         if (_fallHandledRef(__instance)) return;
 
-        // Было _extra.GetOrCreateValue(__instance), блокировка на каждый тик.
-        // Теперь обычный TryGetValue по long-ключу без lock'ов ConditionalWeakTable.
-        // Запись должна уже существовать (создана в Initialize), но на всякий случай
-        // (например, если сущность была создана до применения патча Initialize, либо
-        // при горячей перезагрузке мода) подстраховываемся через GetOrAdd, этот путь
-        // не должен быть горячим, поэтому лишний GetOrAdd тут не страшен.
+        // Угольные кучи спавнят сущности напрямую через TryPartialCollapse,
+        // минуя createFallingBlock. Их lifecycle (подмена инвентаря, DoRemoveBlock=false,
+        // снимок blockEntityAttributes) завязан на ванильный EntityBlockFalling,
+        // поэтому не трогаем их нашими SettleAt / сторожевым таймером.
+        if (__instance.removedBlockentity is BlockEntityCoalPile)
+            return;
+
         ExtraData data = _extra.GetOrAdd(__instance.EntityId, _ => new ExtraData
         {
             SpawnTimeMs = __instance.Api.World.ElapsedMilliseconds
@@ -165,16 +162,6 @@ public static class EntityBlockFallingPatch
 
         long now = __instance.Api.World.ElapsedMilliseconds;
 
-        // Сторожевой таймер против известного vanilla-бага "Falling block entity
-        // does not settle" (форум VS #5775): при массовом обвале падающие сущности
-        // могут скучиваться и физически застревать друг об друга в мелких углах,
-        // никогда не приземляясь сами, ДАЖЕ когда рядом есть игрок (то есть ветка
-        // "игрока нет, падаем мгновенно" ниже тут просто никогда не сработает).
-        // Проверка является дешёвым вычитанием long, throttle тут не нужен, дёргаем на каждом
-        // тике. Значение 0 отключает сторожевой таймер полностью (см. FSMConfig).
-        // Приземляем на ТЕКУЩЕЙ позиции сущности, а не initialPos, иначе блок
-        // телепортировался бы туда, где он уже физически не находится, что было бы
-        // заметно игроку, стоящему рядом и наблюдающему за застрявшим блоком.
         int stuckTimeoutMs = FallingSpawnManager.stuckTimeoutMs;
         if (stuckTimeoutMs > 0 && now - data.SpawnTimeMs > stuckTimeoutMs)
         {
@@ -214,7 +201,7 @@ public static class EntityBlockFallingPatch
     // позицией: initialPos для случая "игрока нет рядом" (там неважно, что позиция
     // логическая, а не физическая, никто не смотрит), и entity.Pos.AsBlockPos для
     // сторожевого таймера "застряла рядом с игроком" (там важно приземлить именно
-    // там, где блок сейчас реально висит, а не телепортировать его).
+    // там, где блок реально висит, а не телепортировать его).
     private static void SettleAt(EntityBlockFalling entity, BlockPos atPos)
     {
         // Защита от повторного входа, OnFallToGround мог поставить этот флаг в тот же тик
@@ -237,7 +224,7 @@ public static class EntityBlockFallingPatch
 
     // =========================================================================
     //  Публичные статические utilities
-    //  (используются FallingSpawnManager и SettleAt выше)
+    //  (используют FallingSpawnManager и SettleAt выше)
     // =========================================================================
 
     /// <summary>
@@ -264,23 +251,23 @@ public static class EntityBlockFallingPatch
 
     /// <summary>
     /// Мгновенно проходит траекторию падения без создания сущности.
-    /// Идёт вниз, пока не найдёт твёрдую поверхность, затем либо ставит блок, либо
+    /// Идёт вниз, пока не найдёт твёрдую поверхность, либо ставит блок, либо
     /// выбрасывает предметы. Используется для блоков за пределами видимости игроков.
     /// </summary>
-    /// <param name="world">Доступ к миру.</param>
-    /// <param name="block">Падающий блок.</param>
-    /// <param name="be">Живой блочный объект (используется только для IBlockEntityContainer.DropContents в конце). Может быть null.</param>
+    /// <param name="world">Доступ к миру.</param</param>
+    /// <param name="block">Падающий блок.</param</param>
+    /// <param name="be">Живой блочный объект (используется только для IBlockEntityContainer.DropContents в конце). Может be null.</param</param>
     /// <param name="beTree">
-    ///     Снимок атрибутов BE, сделанный ДО того, как блок был снят/изменён
-    ///     (у EntityBlockFalling это blockEntityAttributes, у instant-заявок — снимок в RequestSpawn).
-    ///     Именно он уходит в CanAcceptFallOnto / OnFallOnto / FromTreeAttributes. Может быть null.
-    /// </param>
-    /// <param name="startPos">Позиция, с которой блок упал.</param>
-    /// <param name="drops">Заранее вычисленные предметы (могут быть null).</param>
+    //     Снимок атрибутов BE, сделанный ДО того, как блок был снят/изменён
+    //     (у EntityBlockFalling это blockEntityAttributes, у instant-заявок — снимок в RequestSpawn).
+    //     именно он уходит в CanAcceptFallOnto / OnFallOnto / FromTreeAttributes. Может be null.
+    /// </param</param>
+    /// <param name="startPos">Позиция, с которой блок упал.</param</param>
+    /// <param name="drops">Заранее вычисленные предметы (могут be null).</param</param>
     /// <param name="doRemoveBlock">
-    ///     Если true, сначала удаляет блок из <paramref name="startPos"/> (с проверкой
-    ///     корректности). Передавать false, если блок уже был удалён.
-    /// </param>
+    //     Если true, сначала удаляет блок из <paramref name="startPos"/> (с проверкой
+    //     корректности). Передавать false, если блок уже был удалён.
+    /// </param</param>
     public static void SimulateInstantFall(
         IWorldAccessor world,
         Block block,
@@ -306,7 +293,7 @@ public static class EntityBlockFallingPatch
             BlockPos belowPos = finalPos.DownCopy();
             Block belowBlock = world.BlockAccessor.GetMostSolidBlock(belowPos);
 
-            // Даём целевому блоку обработать приземление (например, воронка, рыхлая земля).
+            // Даём целевому блоку обработать приземление (например, воронка, рхлая земля).
             // ВАЖНО: сюда идёт СНИМОК beTree, а не результат повторной сериализации живого BE —
             // иначе, например, BlockEntityCoalPile.MergeWith получит пустой inventory и упадёт с NRE.
             if (belowBlock.CanAcceptFallOnto(world, belowPos, block, beTree))

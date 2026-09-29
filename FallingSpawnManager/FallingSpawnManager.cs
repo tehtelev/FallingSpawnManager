@@ -19,17 +19,17 @@ namespace FallingSpawnManager
 	/// Ограничивает число одновременно существующих EntityBlockFalling, ставит заявки
 	/// в очередь и прогоняет мгновенную симуляцию для блоков за пределами видимости игроков.
 	///
-	/// Мгновенная симуляция (InstantFallSimulation) выполняется не синхронно внутри
+	/// Мгновенная симуляция (SimulateInstantFall) выполняется не синхронно внутри
 	/// RequestSpawn, а через отдельную очередь с лимитом на тик (instantQueue /
 	/// maxInstantPerTick). pendingPositions применяется как guard для обеих веток:
 	/// и для очереди сущностей, и для мгновенной очереди. Это защищает от повторной
 	/// обработки одной и той же позиции и от каскада синхронных SetBlock/ExchangeBlock
 	/// вызовов при массовом обрушении, которое забивало главный поток на десятки секунд.
 	///
-	/// Проверка "не занята ли позиция уже существующей сущностью" раньше делалась
+	/// Проверка " не занята ли позиция уже существующей сущностью" раньше делалась
 	/// через sapi.World.GetNearestEntity(...): пространственный запрос по партиционированию
 	/// мира (проход по entity-партициям в радиусе плюс аллокации и лямбда на каждую попавшую
-	/// сущность), вызывавшийся на каждую заявку в очереди каждый тик. Теперь то же самое
+	/// сущность), вызывавшийся на заявку в очереди каждый тик. Теперь то же самое
 	/// делается за O(1) через activeFallingPositions, набор initialPos всех сейчас активных
 	/// EntityBlockFalling, который поддерживается в актуальном состоянии событиями
 	/// OnEntitySpawn/OnEntityLoaded/OnEntityDespawn.
@@ -44,7 +44,7 @@ namespace FallingSpawnManager
 
 		// Набор initialPos всех сейчас активных (заспавненных) EntityBlockFalling.
 		// Заполняется в OnEntitySpawn/OnEntityLoaded, чистится в OnEntityDespawn, симметрично
-		// totalFallingBlocks выше. Заменяет собой дорогой sapi.World.GetNearestEntity(...)
+		// totalFallingBlocks выше. Заменяет дорогой sapi.World.GetNearestEntity(...)
 		// в ProcessEntityQueue: O(1) HashSet.Contains вместо пространственного запроса.
 		private static HashSet<BlockPos> activeFallingPositions = [];
 
@@ -127,7 +127,7 @@ namespace FallingSpawnManager
 		/// <summary>
 		/// Загрузка конфигурации и начальная инициализация
 		/// </summary>
-		/// <param name="api"></param>
+		/// <param name="api"></param</param>
 		public override void StartPre(ICoreAPI api)
 		{
 			// Грузим конфиг. Если его нет или он с ошибкой, берём значения по умолчанию
@@ -153,7 +153,7 @@ namespace FallingSpawnManager
 		/// <summary>
 		/// Регистрация всех патчей с помощью Harmony
 		/// </summary>
-		/// <param name="api"></param>
+		/// <param name="api"></param</param>
 		private void RegisterPatches(ICoreAPI api)
 		{
 			// EntityBlockFalling.Initialize
@@ -172,7 +172,7 @@ namespace FallingSpawnManager
 				api.Logger.Error("OnGameTick not found");
 
 			// EntityBlockFalling.OnEntityDespawn чистит запись в ConcurrentDictionary<long, ExtraData>
-			// (замена ConditionalWeakTable), что предотвращает утечку памяти на каждую
+			// (замена ConditionalWeakTable), что предотвращает утечки памяти на каждую
 			// упавшую сущность.
 			var despawnMethod = AccessTools.Method(typeof(EntityBlockFalling), "OnEntityDespawn",
 				[typeof(EntityDespawnData)]);
@@ -237,7 +237,7 @@ namespace FallingSpawnManager
 		// Считаем только EntityBlockFalling, а не живых существ.
 		// Помимо счётчика totalFallingBlocks, теперь также поддерживаем
 		// activeFallingPositions, набор initialPos активных сущностей, который
-		// заменяет собой дорогой пространственный запрос в ProcessEntityQueue.
+		// заменяет дорогой пространственный запрос в ProcessEntityQueue.
 		private void OnEntitySpawn(Entity entity)
 		{
 			if (entity.IsCreature || entity is not EntityBlockFalling ebf) return;
@@ -262,7 +262,7 @@ namespace FallingSpawnManager
 		/// <summary>
 		/// Обрабатываем очереди спавна каждый тик:
 		///   1) очередь сущностей ограничена maxFallingLimit;
-		///   2) очередь мгновенных симуляций ограничена maxInstantPerTick, чтобы массовое
+		///   2).queue мгновенных симуляций ограничена maxInstantPerTick, чтобы массовое
 		///      обрушение вне зоны видимости игроков размазывалось по многим тикам,
 		///      а не выполнялось одним синхронным ударом.
 		/// </summary>
@@ -322,7 +322,7 @@ namespace FallingSpawnManager
                     entityBf.Pos.Z += request.PositionOffset.Z;
                 }
 
-                // только ТЕПЕРЬ снимаем guard, entity уже в activeFallingPositions (OnEntitySpawn отработал)
+                // только теперь снимаем guard, entity уже в activeFallingPositions (OnEntitySpawn отработал)
                 pendingPositions.Remove(request.InitialPos);
 
 			}
@@ -348,8 +348,8 @@ namespace FallingSpawnManager
 
                 var drops = request.Block.GetDrops(sapi.World, request.InitialPos, null);
 
-                // Передаём СНИМОК (BlockEntityTree), а не живой BE. Живой BE идёт вторым
-                // аргументом только для DropContents, если блок не сможет лечь на место.
+                // Передаём СНИМОК (BlockEntityTree), а не живой BE. Живой BE передаётся
+                // только ради DropContents контейнера — если блок не сможет лечь на место.
                 EntityBlockFallingPatch.SimulateInstantFall(
                     sapi.World,
                     request.Block,
@@ -366,7 +366,7 @@ namespace FallingSpawnManager
 		/// <summary>
 		/// Просит блок упасть.
 		/// Если игрок рядом, создаёт заявку на спавн сущности (в очередь, если достигнут лимит).
-		/// Если никого рядом, ставит заявку в очередь мгновенной симуляции.
+		/// никого рядом — ставит заявку в очередь мгновенной симуляции.
 		/// </summary>
         public static void RequestSpawn(Block block, BlockEntity be, BlockPos initialPos,
             AssetLocation fallSound, float impactDamageMul,
@@ -494,8 +494,8 @@ namespace FallingSpawnManager
 
 		// Сторожевой таймер (мс) против известного vanilla-бага "Falling block
 		// entity does not settle": падающие сущности могут физически застревать при
-		// массовом обвале и никогда не приземляться сами. Если сущность жива дольше
-		// этого времени и всё ещё не приземлилась, она принудительно укладывается на
+		// массовом obвале и никогда не приземляться сами. Если сущность жива дольше
+		// этого времени и ещё не приземлилась, она принудительно укладывается на
 		// текущей позиции. 0 отключает таймер полностью.
 		public int StuckTimeoutMs = 15000;
 	}
