@@ -4,7 +4,7 @@
         <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
         <OutputPath>bin\$(Configuration)\Mods\mod</OutputPath>
         <Nullable>enable</Nullable>
-        <RootNamespace>FallingSpawnManager</RootNamespace>
+        <RootNamespace>FSMMgr</RootNamespace>
     </PropertyGroup>
     <ItemGroup>
         <Reference Include="protobuf-net">

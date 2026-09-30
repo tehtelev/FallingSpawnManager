@@ -1,9 +1,11 @@
-﻿using HarmonyLib;
+﻿using FSMMgr.Managers;
+using FSMMgr.Utils;
+using HarmonyLib;
 using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
 using Vintagestory.GameContent;
 
-namespace FallingSpawnManager.Patches;
+namespace FSMMgr.Patches;
 
 /// <summary>
 /// Перехватывает падение сыпучих блоков (песок, гравий и т. п.), чтобы спавнить
@@ -31,9 +33,9 @@ public static class BlockBehaviorUnstableFallingPatch
         IWorldAccessor world,
         BlockPos ourPos)
     {
-        var fsm = world.Api.ModLoader.GetModSystem<FallingSpawnManager>();
+        var fsm = world.Api.ModLoader.GetModSystem<FSM>();
         if (fsm == null)
-            return true; // менеджера нет, даём отработать оригинальному коду
+            return true; // менеджера нет, даём отработать originalному коду
 
 
         Block block = world.BlockAccessor.GetBlock(ourPos);
@@ -49,12 +51,12 @@ public static class BlockBehaviorUnstableFallingPatch
         if (__instance.block != currentBlock)
             return false;
 
-        // Ванильный FallingEntityAlreadyExists: если в мире уже есть EntityBlockFalling
+        // Ваничный FallingEntityAlreadyExists: если в мире уже есть EntityBlockFalling
         // с этим initialPos, не плодим вторую. У нас есть O(1) версия этого в менеджере.
         if (FallingSpawnManager.IsPositionActiveOrPending(ourPos))
             return false;
 
-        // Вместо спавна сущности просим менеджер забрать заявку на падение
+        // Вместо спавна сущности просим менеджер взять заявку на падение
         FallingSpawnManager.RequestSpawn(
             block,
             be,
@@ -67,7 +69,7 @@ public static class BlockBehaviorUnstableFallingPatch
             positionOffset: null
         );
 
-        return false; // тело оригинального метода больше не выполняется
+        return false; // тело originalного метода больше не выполняется
     }
     
 

@@ -1,33 +1,34 @@
-﻿using System;
+﻿using FSMMgr.Utils;
+using System;
 using System.Collections.Generic;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
-using Vintagestory.API.MathTools;
 using Vintagestory.API.Config;
+using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 using Vintagestory.API.Util;
 
 #nullable disable
 
-namespace FallingSpawnManager
+namespace FSMMgr.Managers
 {
     /// <summary>
     /// Серверный менеджер слияния лежащих на земле стаков предметов (EntityItem).
     /// Работает с ЛЮБЫМИ EntityItem в мире, независимо от того, кто и как их создал
     /// (наш SpawnDrops, игрок, другие моды, ваниль).
-    ///
+
     /// Архитектура (принципиально отличается от подхода «патч на каждое столкновение»):
     ///   * Никаких Harmony-патчей. Жизненный цикл предметов отслеживается через события
-    ///     OnEntitySpawn / OnEntityLoaded / OnEntityDespawn, которые мы и так используем.
+    ///     OnEntitySpawn / OnEntityLoaded / OnEntityDespawn, которые мы и сами используем.
     ///     Нет хука на Entity.OnCollided (он вызывается для ВСЕХ сущностей каждый тик).
     ///   * Одна общая очередь кандидатов и один тик-листенер вместо RegisterCallback
-    ///     на каждый предмет. Очередь монотонна по времени (задержка у всех одинаковая),
+    ///     на cada предмет. Очередь монотонна по времени (задержка у всех одинаковая),
     ///     поэтому достаточно обычной Queue: смотрим только на голову.
-    ///   * Бюджет попыток на тик (MaxAttemptsPerTick): при загрузке мира с тысячами
-    ///     предметов нагрузка размазывается, а не бьёт по одному тику.
-    ///   * Кандидатом становится только «новичок» (заспавнился / загрузился). Он сам ищет
-    ///     соседей и вливается в них. Лежащие давно предметы повторно не сканируются.
-    ///   * Маленький радиус по умолчанию (1.5 блока по горизонтали, 1 по вертикали):
+    ///   * Бюджет попыток на тик (MaxAttemptsPerTick): при загрузке мира, когда в мире тысячи предметов,
+    ///     нагрузка размазывается, а не бьёт по одному тику.
+    ///   * Кандидатом становится только «новичок» (заспавился / загрузился). Он сам ищет
+    ///     соседей и вливается в них. Давно лежащие предметы повторно не сканируются.
+    ///   * Малёнький радиус по умолчанию (5 по горизонтали и 2 по вертикали):
     ///     предметы не «исчезают» с места, где лежали, и не сливаются между этажами.
     ///   * Упаковка «от большего к меньшему»: самые большие стаки принимают, а доноры
     ///     берутся от самых маленьких. Это минимизирует итоговое число сущностей.
@@ -36,6 +37,9 @@ namespace FallingSpawnManager
     ///     кэшируется на CollectibleObject, строка Code.ToString() строится один раз.
     /// Слияние проходит через ItemSlot.TryPutInto + GetMergableQuantity, то есть все
     /// правила ванили (атрибуты, свежесть/transition-состояния) соблюдаются.
+
+    /// Это статический менеджер со своим чистым функционалом. Инициализацию мода,
+    /// загрузку конфигов и применение патчей курирует FSM (FSM.cs).
     /// </summary>
     public static class ItemClumpManager
     {
@@ -44,20 +48,6 @@ namespace FallingSpawnManager
 
         // Предмет считается «успокоившимся», если скорость не выше 0.075 блока/тик.
         private const double SettledMotionSq = 0.075 * 0.075;
-
-        private sealed class Candidate
-        {
-            public EntityItem Entity;
-            public long EntityId;
-            public long DueMs;
-            public int Attempts;
-            public bool Cancelled;
-
-            // Позиция на прошлой проверке: если предмет «висит» без опоры и не сдвинулся,
-            // физика его не считает (он вне зоны симуляции).
-            public bool HasLastPos;
-            public double LastX, LastY, LastZ;
-        }
 
         private static ICoreServerAPI sapi;
         private static long tickListenerId;
@@ -70,7 +60,7 @@ namespace FallingSpawnManager
         // Переиспользуемые буферы (серверный тик однопоточный).
         private static readonly List<EntityItem> group = new();
 
-        // Кэш результата чёрного списка на коллектибл.
+        // Кэш_result чёрного списка на коллектибл.
         private static readonly Dictionary<CollectibleObject, bool> blacklistCache = new();
         private static string[] blacklistPatterns = [];
 
@@ -83,7 +73,7 @@ namespace FallingSpawnManager
         private static int maxGroupSize;
 
         // Радиус вокруг игрока, дальше которого предметы считаются «замороженными»
-        // (физика их не тикает, скорость и OnGround остаются как при спавне).
+        // (физика их не тикает, скорость и OnGround остаются при спавне).
         // Берём меньшее из радиуса слежения сервера и дальности симуляции сущностей.
         private static int frozenRange;
 
@@ -230,7 +220,7 @@ namespace FallingSpawnManager
 
                 // Предмет вдали от игроков не симулируется, он «заморожен» и не двигается:
                 // ждать его успокоения бессмысленно (он никогда не успокоится), сливаем сразу.
-                // Признаки заморозки, от самого надёжного к резервному:
+                // Принавки заморозки, от самого надёжного к резервному:
                 //   1) сервер сам пометил сущность неактивной (вне зоны симуляции);
                 //   2) рядом с предметом нет ни одного игрока (по дальности симуляции);
                 //   3) ниже, в цикле: предмет висит без опоры и не двигается между проверками.
@@ -253,7 +243,7 @@ namespace FallingSpawnManager
                         c.HasLastPos = true;
                         c.LastX = p.X; c.LastY = p.Y; c.LastZ = p.Z;
 
-                        // Ещё летит или движется: перепроверим позже, но не бесконечно.
+                        // ещё летит или движется: перепроверим позже, но не бесконечно.
                         queue.Dequeue();
                         if (++c.Attempts >= maxSettleAttempts)
                         {

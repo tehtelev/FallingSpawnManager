@@ -1,4 +1,6 @@
-﻿using System.Collections.Concurrent;
+﻿using FSMMgr.Managers;
+using FSMMgr.Utils;
+using System.Collections.Concurrent;
 using HarmonyLib;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
@@ -10,7 +12,7 @@ using Vintagestory.GameContent;
 
 #nullable disable
 
-namespace FallingSpawnManager.Patches;
+namespace FSMMgr.Patches;
 
 /// <summary>
 /// Патчи Harmony для EntityBlockFalling:
@@ -18,7 +20,7 @@ namespace FallingSpawnManager.Patches;
 ///   2) Периодически проверяем, не ушёл ли игрок рядом: если никого нет, блок
 ///      падает мгновенно, а сущность уничтожается, чтобы не оставалось «фантомов».
 ///   3) Сторожевой таймер против известного vanilla-бага "Falling block entity
-///      does not settle" (форум VS #5775): при массовом obвале падающие сущности
+///      does not settle" (форум VS #5775): при массовом обвале падающие сущности
 ///      могут скучиваться и физически застревать друг об друга, никогда не
 ///      приземляясь, даже когда игрок стоит рядом и смотрит на них. Если сущность
 ///      жива дольше stuckTimeoutMs (настраивается в конфиге) и всё ещё не
@@ -80,7 +82,7 @@ public static class EntityBlockFallingPatch
     //  наши побеждают):
     //
     //  a) AlwaysActive = true
-    //     Проще и дешевле, чем патчить геттер базового класса: просто пишем свойство
+    //     Простее и дешевле, чем патчить геттер базового класса: просто пишем свойство
     //     напрямую, бэкинг-поле задаётся один раз в момент спавна.
     //
     //  b) SimulationRange = GlobalConstants.DefaultSimulationRange
@@ -89,7 +91,7 @@ public static class EntityBlockFallingPatch
     //     сущностями, лишних затрат нет, зато проверка близости игрока теперь срабатывает,
     //     когда все игроки покидают область.
     //
-    //  c) Заранее создаём запись в _extra, а не полагаемся на GetOrAdd в OnGameTick.
+    //  c) Зарее создаём запись в _extra, а не полагаемся на GetOrAdd в OnGameTick.
     //     Это разовая операция на спавн сущности, а не на каждый тик.
     // =========================================================================
 
@@ -183,7 +185,7 @@ public static class EntityBlockFallingPatch
     private static bool IsPlayerNearby(EntityBlockFalling entity)
     {
         var sapi = entity.Api as ICoreServerAPI;
-        // Пересчитываем радиус так же, как в FallingSpawnManager.RequestSpawn
+        // Пересчёываем радиус так же, как в FallingSpawnManager.RequestSpawn
         int range = (sapi?.World.DefaultEntityTrackingRange ?? 8) * GlobalConstants.ChunkSize;
         Vec3d pos = entity.Pos.XYZ;
 
@@ -200,7 +202,7 @@ public static class EntityBlockFallingPatch
     // entity.initialPos. Теперь это общий SettleAt(entity, atPos) с явно переданной
     // позицией: initialPos для случая "игрока нет рядом" (там неважно, что позиция
     // логическая, а не физическая, никто не смотрит), и entity.Pos.AsBlockPos для
-    // сторожевого таймера "застряла рядом с игроком" (там важно приземлить именно
+    // сторожевого таймера "застряла рядом с игроком" ( там важно приземлить именно
     // там, где блок реально висит, а не телепортировать его).
     private static void SettleAt(EntityBlockFalling entity, BlockPos atPos)
     {
@@ -250,7 +252,7 @@ public static class EntityBlockFallingPatch
     }
 
     /// <summary>
-    /// Мгновенно проходит траекторию падения без создания сущности.
+    /// Мгновенно проходит траекцию падения без создания сущности.
     /// Идёт вниз, пока не найдёт твёрдую поверхность, либо ставит блок, либо
     /// выбрасывает предметы. Используется для блоков за пределами видимости игроков.
     /// </summary>
@@ -258,15 +260,15 @@ public static class EntityBlockFallingPatch
     /// <param name="block">Падающий блок.</param</param>
     /// <param name="be">Живой блочный объект (используется только для IBlockEntityContainer.DropContents в конце). Может be null.</param</param>
     /// <param name="beTree">
-    //     Снимок атрибутов BE, сделанный ДО того, как блок был снят/изменён
-    //     (у EntityBlockFalling это blockEntityAttributes, у instant-заявок — снимок в RequestSpawn).
-    //     именно он уходит в CanAcceptFallOnto / OnFallOnto / FromTreeAttributes. Может be null.
+    ///     Снимок атрибутов BE, сделанный ДО того, как блок был снят/изменён
+    ///     (у EntityBlockFalling это blockEntityAttributes, у instant-заявок — снимок в RequestSpawn).
+    ///     именно он уходит в CanAcceptFallOnto / OnFallOnto / FromTreeAttributes. Может be null.
     /// </param</param>
     /// <param name="startPos">Позиция, с которой блок упал.</param</param>
-    /// <param name="drops">Заранее вычисленные предметы (могут be null).</param</param>
+    /// <param name="drops">Зарее вычисленные предметы (могут be null).</param</param>
     /// <param name="doRemoveBlock">
-    //     Если true, сначала удаляет блок из <paramref name="startPos"/> (с проверкой
-    //     корректности). Передавать false, если блок уже был удалён.
+    ///     Если true, сначала удаляет блок из <paramref name="startPos"/> (с проверкой
+    ///     корректности. Передавать false, если блок уже был удалён.
     /// </param</param>
     public static void SimulateInstantFall(
         IWorldAccessor world,
@@ -338,7 +340,7 @@ public static class EntityBlockFallingPatch
         }
 
         // Подходящего места нет, разбрасываем предметы.
-        // Здесь живой be нужен только для DropContents контейнера — это соответствует
+        // Здесь живое be нужен только для DropContents контейнера — это соответствует
         // ванильному EntityBlockFalling.DropItems.
         SpawnDrops(world, finalPos, drops, be);
     }

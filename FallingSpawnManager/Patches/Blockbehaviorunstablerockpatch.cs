@@ -1,4 +1,6 @@
-﻿using HarmonyLib;
+﻿using FSMMgr.Managers;
+using FSMMgr.Utils;
+using HarmonyLib;
 using System;
 using System.Linq;
 using Vintagestory.API.Common;
@@ -7,16 +9,17 @@ using Vintagestory.GameContent;
 
 #nullable disable
 
-namespace FallingSpawnManager.Patches;
+namespace FSMMgr.Patches;
 
 /// <summary>
 /// Перехватывает BlockBehaviorUnstableRock.collapseLayer и направляет спавн через
 /// FallingSpawnManager.RequestSpawn вместо прямого создания EntityBlockFalling.
-///
-/// Чем отличается от оригинала:
+
+/// Чем отличается от originalла:
 ///   - Убран ручной контроль дубликатов — дедупликацию делает FallingSpawnManager
 ///     своим HashSet pendingPositions.
-///   - world.SpawnEntity(new EntityBlockFalling(...)) заменён на fsm.RequestSpawn(...).
+///   - world.SpawnEntity(new EntityBlockFalling(...)) заменён на
+///     FallingSpawnManager.RequestSpawn(...).
 ///   - Три вызова checkCollapsibleNeighbours в конце обёрнуты в RegisterCallback с
 ///     задержками 300 / 400 / 500 мс, чтобы цепные обвалы не переполняли стек
 ///     колбэков за один тик.
@@ -37,7 +40,7 @@ public static class BlockBehaviorUnstableRockPatch
         AccessTools.FieldRefAccess<BlockBehaviorUnstableRock, Block>("collapsedBlock");
 
     /// <summary>
-    /// Вернув false, мы полностью пропускаем тело оригинального метода.
+    /// Вернув false, мы полностью пропускаем тело originalного метода.
     /// </summary>
     [HarmonyPrefix]
     [HarmonyPatch(typeof(BlockBehaviorUnstableRock), "collapseLayer")]
@@ -47,7 +50,7 @@ public static class BlockBehaviorUnstableRockPatch
         IOrderedEnumerable<BlockPos> yorderedPositions,
         int y)
     {
-        FallingSpawnManager fsm = world.Api.ModLoader.GetModSystem<FallingSpawnManager>();
+        var fsm = world.Api.ModLoader.GetModSystem<FSM>();
 
         AssetLocation fallSound = _fallSoundRef(__instance);
         float impactDamageMul = _impactDamageMulRef(__instance);
