@@ -230,6 +230,9 @@ namespace FallingSpawnManager
 			// Тик очереди спавна каждые 32 мс
 			api.Event.RegisterGameTickListener(OnGameTick, 32);
 
+			// Слияние лежащих стаков предметов (любые EntityItem в мире)
+			ItemClumpManager.Initialize(api, _config);
+
 			_initialized = true;
 
 		}
@@ -432,6 +435,7 @@ namespace FallingSpawnManager
 			instantQueue?.Clear();
 			pendingPositions?.Clear();
 			activeFallingPositions?.Clear(); // чистим и набор активных позиций
+			ItemClumpManager.Dispose();
 			totalFallingBlocks = 0;
 			if (sapi != null)
 			{
@@ -498,5 +502,31 @@ namespace FallingSpawnManager
 		// этого времени и ещё не приземлилась, она принудительно укладывается на
 		// текущей позиции. 0 отключает таймер полностью.
 		public int StuckTimeoutMs = 15000;
+
+		// ----- Слияние предметов на земле (ItemClumpManager) -----
+
+		// Включает слияние лежащих стаков одного типа.
+		public bool ItemClumpEnabled = true;
+
+		// Радиус поиска соседних предметов (блоки): по горизонтали и по вертикали.
+		public float ItemClumpRadius = 5f;
+		public float ItemClumpVerticalRadius = 5.0f;
+
+		// Пауза (мс) после спавна/загрузки предмета и между повторными попытками,
+		// если он ещё не успокоился.
+		public int ItemClumpDelayMs = 1500;
+
+		// Сколько раз повторять попытку, пока предмет не лёг на землю.
+		public int ItemClumpMaxSettleAttempts = 20;
+
+		// Бюджет попыток слияния за один тик менеджера (250 мс).
+		public int ItemClumpMaxAttemptsPerTick = 25;
+
+		// Максимум предметов в одной группе слияния.
+		public int ItemClumpMaxGroupSize = 32;
+
+		// Полные коды предметов/блоков, которые не сливаются. Поддерживается '*':
+		// "game:gear-*" или "@regex". Регистр не важен, код без домена считается ванильным.
+		public List<string> ItemClumpBlacklist = [];
 	}
 }
