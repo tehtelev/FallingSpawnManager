@@ -509,8 +509,8 @@ namespace FallingSpawnManager
 		public bool ItemClumpEnabled = true;
 
 		// Радиус поиска соседних предметов (блоки): по горизонтали и по вертикали.
-		public float ItemClumpRadius = 5f;
-		public float ItemClumpVerticalRadius = 5.0f;
+		public float ItemClumpRadius = 5.0f;
+		public float ItemClumpVerticalRadius = 2.0f;
 
 		// Пауза (мс) после спавна/загрузки предмета и между повторными попытками,
 		// если он ещё не успокоился.
@@ -528,5 +528,8 @@ namespace FallingSpawnManager
 		// Полные коды предметов/блоков, которые не сливаются. Поддерживается '*':
 		// "game:gear-*" или "@regex". Регистр не важен, код без домена считается ванильным.
 		public List<string> ItemClumpBlacklist = [];
+
+		// Раз в 10 секунд пишет в лог статистику слияния (для диагностики).
+		public bool ItemClumpDebug = false;
 	}
 }

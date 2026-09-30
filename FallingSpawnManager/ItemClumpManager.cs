@@ -52,6 +52,11 @@ namespace FallingSpawnManager
             public long DueMs;
             public int Attempts;
             public bool Cancelled;
+
+            // Позиция на прошлой проверке: если предмет «висит» без опоры и не сдвинулся,
+            // физика его не считает (он вне зоны симуляции).
+            public bool HasLastPos;
+            public double LastX, LastY, LastZ;
         }
 
         private static ICoreServerAPI sapi;
@@ -81,6 +86,13 @@ namespace FallingSpawnManager
         // (физика их не тикает, скорость и OnGround остаются как при спавне).
         // Берём меньшее из радиуса слежения сервера и дальности симуляции сущностей.
         private static int frozenRange;
+
+        // ---- Отладка (ItemClumpDebug в конфиге) ----
+        private static bool debug;
+        private static long debugNextLogMs;
+        private static int dbgEnqueued, dbgProcessed, dbgInvalid, dbgFrozen, dbgRetried,
+                           dbgGaveUp, dbgSearchLt2, dbgGroupLt2, dbgMerged, dbgKilled, dbgQueueMax, dbgHovering;
+        private static int dbgSamples;
 
         // Параметр для статического предиката поиска (без лямбды-замыкания на каждый вызов).
         private static CollectibleObject matchCollectible;
@@ -112,6 +124,11 @@ namespace FallingSpawnManager
             try { trackingRange = Math.Min(trackingRange, api.World.DefaultEntityTrackingRange * GlobalConstants.ChunkSize); }
             catch { /* оставляем дальность симуляции */ }
             frozenRange = Math.Max(trackingRange, GlobalConstants.ChunkSize);
+
+            debug = cfg.ItemClumpDebug;
+            debugNextLogMs = 0;
+            api.Logger.Notification("[FSM] ItemClump: enabled, radius={0}/{1}, frozenRange={2}, debug={3}",
+                radius, verticalRadius, frozenRange, debug);
 
             api.Event.OnEntitySpawn += OnEntitySpawn;
             api.Event.OnEntityLoaded += OnEntitySpawn;      // одинаковая логика для спавна и загрузки
@@ -169,6 +186,7 @@ namespace FallingSpawnManager
             };
             byId[c.EntityId] = c;
             queue.Enqueue(c);
+            dbgEnqueued++;
         }
 
         // ---------------------------------------------------------------------
@@ -178,9 +196,16 @@ namespace FallingSpawnManager
         private static void OnTick(float dt)
         {
             long now = sapi.World.ElapsedMilliseconds;
-            int budget = maxAttemptsPerTick;
 
-            while (budget > 0 && queue.Count > 0)
+            // Два независимых бюджета:
+            //   clumpBudget: дорогие попытки слияния (запрос GetEntitiesAround + TryPutInto);
+            //   scanBudget: дешёвые проверки очереди (жив ли, лежит ли, есть ли игрок рядом).
+            // Раньше был один общий бюджет, и очередь целиком забивалась повторными
+            // проверками ещё падающих предметов, до реальных слияний дело не доходило.
+            int clumpBudget = maxAttemptsPerTick;
+            int scanBudget = Math.Max(500, maxAttemptsPerTick * 20);
+
+            while (scanBudget-- > 0 && queue.Count > 0)
             {
                 Candidate c = queue.Peek();
 
@@ -192,43 +217,91 @@ namespace FallingSpawnManager
 
                 if (c.DueMs > now) break; // очередь монотонна, дальше тоже рано
 
+                EntityItem e = c.Entity;
+                dbgProcessed++;
+
+                if (!IsValid(e))
+                {
+                    queue.Dequeue();
+                    byId.Remove(c.EntityId);
+                    dbgInvalid++;
+                    continue;
+                }
+
+                // Предмет вдали от игроков не симулируется, он «заморожен» и не двигается:
+                // ждать его успокоения бессмысленно (он никогда не успокоится), сливаем сразу.
+                // Признаки заморозки, от самого надёжного к резервному:
+                //   1) сервер сам пометил сущность неактивной (вне зоны симуляции);
+                //   2) рядом с предметом нет ни одного игрока (по дальности симуляции);
+                //   3) ниже, в цикле: предмет висит без опоры и не двигается между проверками.
+                bool frozen = e.State == EnumEntityState.Inactive || NoPlayerNear(e.ServerPos);
+
+                if (!frozen && !IsSettled(e))
+                {
+                    var p = e.ServerPos;
+
+                    // Живая физика не даёт предмету без опоры стоять на месте: за 1.5 с он
+                    // обязан сдвинуться. Если позиция не изменилась, предмет завис в воздухе
+                    // вне зоны симуляции. Ждать нечего, сливаем как замороженный.
+                    if (c.HasLastPos && SqDist(p.X, p.Y, p.Z, c.LastX, c.LastY, c.LastZ) < 1e-4)
+                    {
+                        frozen = true;
+                        dbgHovering++;
+                    }
+                    else
+                    {
+                        c.HasLastPos = true;
+                        c.LastX = p.X; c.LastY = p.Y; c.LastZ = p.Z;
+
+                        // Ещё летит или движется: перепроверим позже, но не бесконечно.
+                        queue.Dequeue();
+                        if (++c.Attempts >= maxSettleAttempts)
+                        {
+                            byId.Remove(c.EntityId);
+                            dbgGaveUp++;
+                        }
+                        else
+                        {
+                            c.DueMs = now + delayMs;
+                            queue.Enqueue(c);
+                            dbgRetried++;
+                        }
+                        continue;
+                    }
+                }
+
+                if (frozen) dbgFrozen++;
+
+                // Готов к слиянию, но бюджет дорогих попыток на этот тик исчерпан:
+                // оставляем в голове очереди до следующего тика.
+                if (clumpBudget <= 0) break;
+                clumpBudget--;
+
                 queue.Dequeue();
-                budget--;
-                Process(c, now);
+                // Снимаем с учёта ДО слияния: если предмет останется, он может
+                // снова стать кандидатом (например, при перезагрузке чанка).
+                byId.Remove(c.EntityId);
+                TryClump(e, frozen);
             }
+
+            if (debug) DebugLog(now);
         }
 
-        private static void Process(Candidate c, long now)
+        private static void DebugLog(long now)
         {
-            EntityItem e = c.Entity;
+            if (queue.Count > dbgQueueMax) dbgQueueMax = queue.Count;
+            if (now < debugNextLogMs) return;
+            debugNextLogMs = now + 10000;
 
-            if (!IsValid(e))
-            {
-                byId.Remove(c.EntityId);
-                return;
-            }
+            sapi.Logger.Notification(
+                "[FSM] ItemClump 10s: enqueued={0} processed={1} invalid={2} frozen={3} (hovering={12}) retried={4} gaveUp={5} " +
+                "search<2={6} group<2={7} mergedOps={8} donorsKilled={9} queue={10} (max {11})",
+                dbgEnqueued, dbgProcessed, dbgInvalid, dbgFrozen, dbgRetried, dbgGaveUp,
+                dbgSearchLt2, dbgGroupLt2, dbgMerged, dbgKilled, queue.Count, dbgQueueMax, dbgHovering);
 
-            // Предмет вдали от игроков не симулируется, он «заморожен» и не двигается:
-            // ждать его успокоения бессмысленно (он никогда не успокоится), сливаем сразу.
-            bool frozen = NoPlayerNear(e.ServerPos.XYZ);
-
-            if (!frozen && !IsSettled(e))
-            {
-                // Ещё летит или движется: пробуем позже, но не бесконечно.
-                if (++c.Attempts >= maxSettleAttempts)
-                {
-                    byId.Remove(c.EntityId);
-                    return;
-                }
-                c.DueMs = now + delayMs;
-                queue.Enqueue(c);
-                return;
-            }
-
-            // Снимаем с учёта ДО слияния: если предмет останется, он может
-            // снова стать кандидатом (например, при перезагрузке чанка).
-            byId.Remove(c.EntityId);
-            TryClump(e, frozen);
+            dbgEnqueued = dbgProcessed = dbgInvalid = dbgFrozen = dbgRetried = dbgGaveUp =
+                dbgSearchLt2 = dbgGroupLt2 = dbgMerged = dbgKilled = dbgQueueMax = dbgHovering = 0;
+            dbgSamples = 0;
         }
 
         // ---------------------------------------------------------------------
@@ -255,7 +328,14 @@ namespace FallingSpawnManager
                 matchCollectible = null;
             }
 
-            if (found == null || found.Length < 2) return;
+            if (debug && dbgSamples < 5)
+            {
+                dbgSamples++;
+                sapi.Logger.Notification("[FSM] ItemClump sample: {0} x{1} at {2} frozen={3} found={4}",
+                    coll.Code, rootStack.StackSize, root.ServerPos.XYZ, frozen, found?.Length ?? -1);
+            }
+
+            if (found == null || found.Length < 2) { dbgSearchLt2++; return; }
 
             group.Clear();
             group.Add(root);
@@ -266,7 +346,7 @@ namespace FallingSpawnManager
                 group.Add(other);
             }
 
-            if (group.Count < 2) { group.Clear(); return; }
+            if (group.Count < 2) { dbgGroupLt2++; group.Clear(); return; }
 
             // Крупные стаки первыми (получатели), при равенстве по EntityId для детерминизма.
             group.Sort(bySizeDesc);
@@ -297,11 +377,15 @@ namespace FallingSpawnManager
                     // Переприсваивание через свойство Itemstack помечает watched-атрибуты
                     // грязными, иначе клиенты увидят старый размер стака.
                     recv.Itemstack = recv.Slot.Itemstack;
+                    dbgMerged++;
                 }
 
                 ItemStack left = donor.Slot.Itemstack;
                 if (left == null || left.StackSize <= 0)
+                {
                     donor.Die(EnumDespawnReason.Removed);
+                    dbgKilled++;
+                }
                 else
                     donor.Itemstack = left;
             }
@@ -335,8 +419,9 @@ namespace FallingSpawnManager
                 && e.Slot.Itemstack.StackSize > 0;
         }
 
-        private static bool NoPlayerNear(Vec3d pos)
+        private static bool NoPlayerNear(EntityPos ep)
         {
+            Vec3d pos = ep.XYZ;
             int r = frozenRange;
             foreach (IPlayer player in sapi.World.AllOnlinePlayers)
             {
@@ -345,6 +430,12 @@ namespace FallingSpawnManager
                     return false;
             }
             return true;
+        }
+
+        private static double SqDist(double x1, double y1, double z1, double x2, double y2, double z2)
+        {
+            double dx = x1 - x2, dy = y1 - y2, dz = z1 - z2;
+            return dx * dx + dy * dy + dz * dz;
         }
 
         private static bool IsSettled(EntityItem e)
