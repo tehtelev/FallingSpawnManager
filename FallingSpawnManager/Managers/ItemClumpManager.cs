@@ -1,6 +1,7 @@
 ﻿using FSMMgr.Utils;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.Config;
@@ -17,10 +18,9 @@ namespace FSMMgr.Managers
     /// Работает с ЛЮБЫМИ EntityItem в мире, независимо от того, кто и как их создал
     /// (наш SpawnDrops, игрок, другие моды, ваниль).
 
-    /// Архитектура (принципиально отличается от подхода «патч на каждое столкновение»):
-    ///   * Никаких Harmony-патчей. Жизненный цикл предметов отслеживается через события
+    /// Архитектура:
+    ///   * Жизненный цикл предметов отслеживается через события
     ///     OnEntitySpawn / OnEntityLoaded / OnEntityDespawn, которые мы и сами используем.
-    ///     Нет хука на Entity.OnCollided (он вызывается для ВСЕХ сущностей каждый тик).
     ///   * Одна общая очередь кандидатов и один тик-листенер вместо RegisterCallback
     ///     на cada предмет. Очередь монотонна по времени (задержка у всех одинаковая),
     ///     поэтому достаточно обычной Queue: смотрим только на голову.
@@ -46,8 +46,8 @@ namespace FSMMgr.Managers
         // Период тика менеджера. Точность не важна, достаточно нескольких раз в секунду.
         private const int TickIntervalMs = 250;
 
-        // Предмет считается «успокоившимся», если скорость не выше 0.075 блока/тик.
-        private const double SettledMotionSq = 0.075 * 0.075;
+        // Предмет считается «успокоившимся», если скорость не выше 0.005d блока/тик.
+        private const double SettledMotionSq = 0.005d;
 
         private static ICoreServerAPI sapi;
         private static long tickListenerId;
@@ -443,23 +443,20 @@ namespace FSMMgr.Managers
 
         private static string[] NormalizeBlacklist(List<string> raw)
         {
-            var result = new List<string>();
-            if (raw == null) return result.ToArray();
+            if (raw == null) return [];
 
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (string entry in raw)
-            {
-                if (string.IsNullOrWhiteSpace(entry)) continue;
+            return raw
+                .Where(entry => !string.IsNullOrWhiteSpace(entry))
+                .Select(entry => AddDefaultDomain(entry.Trim()))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
 
-                string code = entry.Trim();
-                // Регистр не важен: WildcardUtil сравнивает без учёта регистра.
-                // Код без домена считаем ванильным: "gear-rusty" -> "game:gear-rusty".
-                // Паттерны-регулярки ("@...") не трогаем.
-                if (code[0] != '@' && !code.Contains(':')) code = "game:" + code;
-
-                if (seen.Add(code)) result.Add(code);
-            }
-            return result.ToArray();
+        // Код без домена считаем ванильным: "gear-rusty" -> "game:gear-rusty".
+        // Паттерны-регулярки ("@...") не трогаем.
+        private static string AddDefaultDomain(string code)
+        {
+            return code[0] == '@' || code.Contains(':') ? code : "game:" + code;
         }
 
         private static bool IsBlacklisted(CollectibleObject coll)
