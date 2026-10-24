@@ -1,4 +1,4 @@
-﻿using FSMMgr.Utils;
+using FSMMgr.Utils;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -8,6 +8,7 @@ using Vintagestory.API.Config;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 using Vintagestory.API.Util;
+using Vintagestory.GameContent;
 
 #nullable disable
 
@@ -22,7 +23,7 @@ namespace FSMMgr.Managers
     ///   * Жизненный цикл предметов отслеживается через события
     ///     OnEntitySpawn / OnEntityLoaded / OnEntityDespawn, которые мы и сами используем.
     ///   * Одна общая очередь кандидатов и один тик-листенер вместо RegisterCallback
-    ///     на cada предмет. Очередь монотонна по времени (задержка у всех одинаковая),
+    ///     на каждый предмет. Очередь монотонна по времени (задержка у всех одинаковая),
     ///     поэтому достаточно обычной Queue: смотрим только на голову.
     ///   * Бюджет попыток на тик (MaxAttemptsPerTick): при загрузке мира, когда в мире тысячи предметов,
     ///     нагрузка размазывается, а не бьёт по одному тику.
@@ -49,6 +50,10 @@ namespace FSMMgr.Managers
         // Предмет считается «успокоившимся», если скорость не выше 0.005d блока/тик.
         private const double SettledMotionSq = 0.005d;
 
+        // Пик-окно (мс): стак, который только что бросил игрок, не участвует в слиянии,
+        // пока не пройдёт vanilla-окно подбора (см. EntityItem.CanCollect = 1000 мс).
+        private static int pickupWindowMs = 1000;
+
         private static ICoreServerAPI sapi;
         private static long tickListenerId;
         private static bool running;
@@ -60,9 +65,16 @@ namespace FSMMgr.Managers
         // Переиспользуемые буферы (серверный тик однопоточный).
         private static readonly List<EntityItem> group = new();
 
-        // Кэш_result чёрного списка на коллектибл.
+        // Кэш-флаг чёрного списка на коллектибл (сливалось/не сливалось).
         private static readonly Dictionary<CollectibleObject, bool> blacklistCache = new();
         private static string[] blacklistPatterns = [];
+
+        // Класс (первый лэнд-клайм) каждой сущности в текущей группе. Стак-донор и стак-получатель
+        // сливаются только если у них одинаковый класс (оба в одном лэнд-клайме или оба вне клаймов).
+        private static readonly Dictionary<EntityItem, LandClaim> claimOf = new();
+
+        // Позиция группы на прошлом тике: если группа «висит» без опоры и не сдвинулась, она замерзает.
+        private static Vec3d lastGroupPos = new Vec3d();
 
         // Параметры (санитизируются в Initialize).
         private static float radius;
@@ -74,7 +86,7 @@ namespace FSMMgr.Managers
 
         // Радиус вокруг игрока, дальше которого предметы считаются «замороженными»
         // (физика их не тикает, скорость и OnGround остаются при спавне).
-        // Берём меньшее из радиуса слежения сервера и дальности симуляции сущностей.
+        // Радиус слежения: меньше дальности симуляции сущностей не бывает (см. Initialize).
         private static int frozenRange;
 
         // ---- Отладка (ItemClumpDebug в конфиге) ----
@@ -220,15 +232,15 @@ namespace FSMMgr.Managers
 
                 // Предмет вдали от игроков не симулируется, он «заморожен» и не двигается:
                 // ждать его успокоения бессмысленно (он никогда не успокоится), сливаем сразу.
-                // Принавки заморозки, от самого надёжного к резервному:
+                // Признаки заморозки, от самого надёжного к резервному:
                 //   1) сервер сам пометил сущность неактивной (вне зоны симуляции);
                 //   2) рядом с предметом нет ни одного игрока (по дальности симуляции);
                 //   3) ниже, в цикле: предмет висит без опоры и не двигается между проверками.
-                bool frozen = e.State == EnumEntityState.Inactive || NoPlayerNear(e.ServerPos);
+                bool frozen = e.State == EnumEntityState.Inactive || NoPlayerNear(e.Pos);
 
                 if (!frozen && !IsSettled(e))
                 {
-                    var p = e.ServerPos;
+                    var p = e.Pos;
 
                     // Живая физика не даёт предмету без опоры стоять на месте: за 1.5 с он
                     // обязан сдвинуться. Если позиция не изменилась, предмет завис в воздухе
@@ -236,7 +248,6 @@ namespace FSMMgr.Managers
                     if (c.HasLastPos && SqDist(p.X, p.Y, p.Z, c.LastX, c.LastY, c.LastZ) < 1e-4)
                     {
                         frozen = true;
-                        dbgHovering++;
                     }
                     else
                     {
@@ -263,7 +274,7 @@ namespace FSMMgr.Managers
                 if (frozen) dbgFrozen++;
 
                 // Готов к слиянию, но бюджет дорогих попыток на этот тик исчерпан:
-                // оставляем в голове очереди до следующего тика.
+                // оставляем в головы очереди до следующего тика.
                 if (clumpBudget <= 0) break;
                 clumpBudget--;
 
@@ -311,7 +322,7 @@ namespace FSMMgr.Managers
             Entity[] found;
             try
             {
-                found = sapi.World.GetEntitiesAround(root.ServerPos.XYZ, radius, verticalRadius, matcher);
+                found = sapi.World.GetEntitiesAround(root.Pos.XYZ, radius, verticalRadius, matcher);
             }
             finally
             {
@@ -322,10 +333,12 @@ namespace FSMMgr.Managers
             {
                 dbgSamples++;
                 sapi.Logger.Notification("[FSM] ItemClump sample: {0} x{1} at {2} frozen={3} found={4}",
-                    coll.Code, rootStack.StackSize, root.ServerPos.XYZ, frozen, found?.Length ?? -1);
+                    coll.Code, rootStack.StackSize, root.Pos.XYZ, frozen, found?.Length ?? -1);
             }
 
             if (found == null || found.Length < 2) { dbgSearchLt2++; return; }
+
+            long now = sapi.World.ElapsedMilliseconds;
 
             group.Clear();
             group.Add(root);
@@ -333,6 +346,7 @@ namespace FSMMgr.Managers
             {
                 if (found[i] is not EntityItem other || other == root) continue;
                 if (!IsValid(other) || (!frozen && !IsSettled(other))) continue;
+                if (InPickupWindow(other, now)) continue; // ещё в пик-окне, не участвует в слиянии
                 group.Add(other);
             }
 
@@ -358,15 +372,35 @@ namespace FSMMgr.Managers
                     int space = rs.Collectible.MaxStackSize - rs.StackSize;
                     if (space <= 0) continue;
 
+                    // Стаки с разными часами диспанна (например, kept-предмет) не сливаются:
+                    // иначе один из них получил бы неверный срок жизни.
+                    if (DespawnOverride(donor) != DespawnOverride(recv)) continue;
+
                     // Правила ванили: совпадение атрибутов, свежесть и т. п.
                     if (rs.Collectible.GetMergableQuantity(rs, ds, EnumMergePriority.AutoMerge) <= 0) continue;
 
+                    // Стак-донор и стак-получатель должны быть рядом (в пределах radius друг от
+                    // друга и в одном лэнд-клайме), иначе «цепочка» группы слилась бы неправильно.
+                    if (!InMergeRange(donor, recv) || !SameClaim(donor, recv)) continue;
+
+                    int receiverBefore = rs.StackSize;
                     int moved = donor.Slot.TryPutInto(sapi.World, recv.Slot, Math.Min(space, ds.StackSize));
-                    if (moved <= 0) continue;
+                    if (moved <= 0)
+                    {
+                        // Проверка слияния может прогнать transition-обновление, которое меняет стак
+                        // на месте, но не перемещает: надо синхронизировать сущности и чанки.
+                        ResyncStack(donor);
+                        ResyncStack(recv);
+                        continue;
+                    }
+
+                    MergeDespawnClock(donor, recv, receiverBefore, moved);
 
                     // Переприсваивание через свойство Itemstack помечает watched-атрибуты
                     // грязными, иначе клиенты увидят старый размер стака.
                     recv.Itemstack = recv.Slot.Itemstack;
+                    recv.WatchedAttributes.MarkPathDirty("itemstack");
+                    MarkChunkModified(recv);
                     dbgMerged++;
                 }
 
@@ -377,10 +411,95 @@ namespace FSMMgr.Managers
                     dbgKilled++;
                 }
                 else
+                {
                     donor.Itemstack = left;
+                    donor.WatchedAttributes.MarkPathDirty("itemstack");
+                    MarkChunkModified(donor);
+                }
             }
 
             group.Clear();
+        }
+
+        // Переприсваивание через свойство Itemstack помечает watched-атрибуты
+        // грязными, иначе клиенты увидят старый размер стака. Пустой стак убивает сущность.
+        private static void ResyncStack(EntityItem e)
+        {
+            if (!e.Alive) return;
+
+            ItemStack stack = e.Slot.Itemstack;
+            if (stack == null || stack.StackSize <= 0)
+            {
+                MarkChunkModified(e);
+                e.Die(EnumDespawnReason.Removed);
+                return;
+            }
+
+            e.Itemstack = stack;
+            e.WatchedAttributes.MarkPathDirty("itemstack");
+            MarkChunkModified(e);
+        }
+
+        // Помечает чанк, в котором числится сущность (InChunkIndex3d, индекс чанка за ней следит раз в секунду),
+        // чтобы сохранение не записало старый размер стака после слияния через границу чанка.
+        private static void MarkChunkModified(EntityItem e)
+        {
+            sapi.WorldManager.GetChunk(e.InChunkIndex3d)?.MarkModified();
+        }
+
+        // Оставшиеся часы диспанна стака (kept-предмет ставит minsecondsToDespawn). Разные часы —
+        // стак не сливается с другими (см. DespawnOverride).
+        private static int DespawnOverride(EntityItem e)
+        {
+            return e.Attributes.GetInt("minsecondsToDespawn");
+        }
+
+        // Средний по весу час диспанна: получатель усредняет deathTime по количеству предметов
+        // с каждой стороны, чтобы стаки с разным сроком жизни не портили друг друга.
+        private static void MergeDespawnClock(EntityItem donor, EntityItem recv, int receiverBefore, int moved)
+        {
+            EntityBehaviorDespawn donorClock = donor.GetBehavior<EntityBehaviorDespawn>();
+            EntityBehaviorDespawn recvClock = recv.GetBehavior<EntityBehaviorDespawn>();
+            if (donorClock == null || recvClock == null) return;
+
+            double total = (double)receiverBefore + moved;
+            if (total <= 0) return;
+
+            recvClock.DeathTime = (float)((recvClock.DeathTime * (double)receiverBefore + donorClock.DeathTime * (double)moved) / total);
+        }
+
+        // Стак-донор и стак-получатель должны быть рядом (в пределах radius друг от друга и в одном
+        // лэнд-клайме), иначе «цепочка» группы слилась бы неправильно.
+        private static bool InMergeRange(EntityItem a, EntityItem b)
+        {
+            var pa = a.Pos;
+            var pb = b.Pos;
+            double dx = pa.X - pb.X, dz = pa.Z - pb.Z;
+            return dx * dx + dz * dz <= (double)radius * radius && Math.Abs(pa.Y - pb.Y) <= verticalRadius;
+        }
+
+        // Класс (первый лэнд-клайм) каждой сущности в текущей группе. Стак-донор и стак-получатель
+        // сливаются только если у них одинаковый класс (оба в одном лэнд-клайме или оба вне клаймов).
+        private static LandClaim ClaimOf(EntityItem e)
+        {
+            if (claimOf.TryGetValue(e, out LandClaim claim)) return claim;
+
+            LandClaim[] claims = sapi.World.Claims.Get(e.Pos.AsBlockPos);
+            claim = claims != null && claims.Length > 0 ? claims[0] : null;
+            claimOf[e] = claim;
+            return claim;
+        }
+
+        private static bool SameClaim(EntityItem a, EntityItem b)
+        {
+            return ClaimOf(a) == ClaimOf(b);
+        }
+
+        // Пик-окно: стак, который только что бросил игрок (ByPlayerUid не null), не участвует
+        // в слиянии, пока не пройдёт vanilla-окно подбора (EntityItem.CanCollect).
+        private static bool InPickupWindow(EntityItem e, long now)
+        {
+            return e.ByPlayerUid != null && now - e.itemSpawnedMilliseconds <= pickupWindowMs;
         }
 
         // ---------------------------------------------------------------------
@@ -433,7 +552,7 @@ namespace FSMMgr.Managers
             // Опора: земля или жидкость (в воде/лаве предмет не «лежит», а плавает).
             // Полёт по воздуху не подходит: такой предмет ещё движется.
             if (!e.OnGround && !e.FeetInLiquid && !e.Swimming) return false;
-            var m = e.ServerPos.Motion;
+            var m = e.Pos.Motion;
             return m.X * m.X + m.Y * m.Y + m.Z * m.Z <= SettledMotionSq;
         }
 
