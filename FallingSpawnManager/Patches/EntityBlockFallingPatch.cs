@@ -25,7 +25,7 @@ namespace FSMMgr.Patches;
 /// Обе развязки (таймаут, нет игрока) выполняются в главном потоке через EnqueueMainThreadTask: при
 /// RegionTicking OnGameTick идёт в рабочем потоке, а SetBlock оттуда небезопасен.
 ///
-/// Публичные SimulateInstantFall / SpawnDrops использует FallingSpawnManager.
+/// Публичные SimulateInstantFall / SpawnDrops используют FallingSpawnManager.
 /// </summary>
 public static class EntityBlockFallingPatch
 {

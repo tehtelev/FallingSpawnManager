@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 
 namespace FSMMgr.Utils
 {
@@ -7,8 +7,8 @@ namespace FSMMgr.Utils
     /// </summary>
     public class FSMConfig
     {
-        // Максимум живых EntityBlockFalling. Лишние заявки ждут в очереди (FIFO). Меньше значение - ровнее тик,
-        // но дольше обвал (куча ~13.6k блоков: 1000 даёт ~4.4 мс MSPT и >4 минут, 5000 ~15 мс и ~190 с,
+        // Максимум живых EntityBlockFalling. Лишние заявки ждут в очереди (FIFO). Меньше значение — ровнее тик,
+        // но дольше обвал (куча ~13.6k блоков: 1000 даёт ~4.4 мс MSPT и >4 минут, 5000 даёт ~15 мс и ~190 с,
         // ваниль ~22 мс и ~134 с). Диапазон 10..10000.
         public int MaxFallingLimit = 1000;
 

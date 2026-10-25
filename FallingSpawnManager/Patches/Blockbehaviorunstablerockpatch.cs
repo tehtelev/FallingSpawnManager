@@ -64,7 +64,7 @@ public static class BlockBehaviorUnstableRockPatch
 
             if (pos.Y > y)
             {
-                // Захватываем nextY для лямбды: pos.Y это Y следующего слоя
+                // Захватываем nextY для лямбды: pos.Y — это Y следующего слоя
                 int nextY = pos.Y;
                 world.Api.Event.RegisterCallback(
                     (dt) => collapseLayer_Prefix(__instance, world, yorderedPositions, nextY),

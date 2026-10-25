@@ -6,7 +6,7 @@ namespace FSMMgr.Utils
 {
     /// <summary>
     /// Данные одной заявки на спавн в очереди (используется и для requestQueue,
-    /// и для instantQueue. RetryCount актуален только для requestQueue).
+    /// и для instantQueue). RetryCount актуален только для requestQueue.
     /// </summary>
     public struct SpawnRequest
     {
