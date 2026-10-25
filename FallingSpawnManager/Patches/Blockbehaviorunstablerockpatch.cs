@@ -1,5 +1,4 @@
-﻿using FSMMgr.Managers;
-using FSMMgr.Utils;
+using FSMMgr.Managers;
 using HarmonyLib;
 using System;
 using System.Linq;
@@ -14,19 +13,19 @@ namespace FSMMgr.Patches;
 /// <summary>
 /// Перехватывает BlockBehaviorUnstableRock.collapseLayer и направляет спавн через
 /// FallingSpawnManager.RequestSpawn вместо прямого создания EntityBlockFalling.
-
-/// Чем отличается от originalла:
-///   - Убран ручной контроль дубликатов — дедупликацию делает FallingSpawnManager
-///     своим HashSet pendingPositions.
-///   - world.SpawnEntity(new EntityBlockFalling(...)) заменён на
-///     FallingSpawnManager.RequestSpawn(...).
-///   - Три вызова checkCollapsibleNeighbours в конце обёрнуты в RegisterCallback с
-///     задержками 300 / 400 / 500 мс, чтобы цепные обвалы не переполняли стек
-///     колбэков за один тик.
+///
+/// Отличия от оригинала:
+///   - Дедупликацию делает FallingSpawnManager (pendingPositions).
+///   - Проверки соседей в конце разнесены RegisterCallback'ами на 300 / 400 / 500 мс.
+///   - Цепочка обрывается, если в слое нет ничего нового. В ванили заспавненная сущность убирает
+///     камень сразу, и один регион не находится дважды, цепочка кончается за несколько уровней.
+///     Камень в очереди остаётся на месте (до разрешения падения), поэтому каждый вложенный вызов
+///     находил тот же регион заново, а RequestSpawn лишь отвечал "уже в очереди". На тонком слое
+///     13x13 это давало вложенность до 108 и 2592 вызовов collapseLayer за один обвал.
+///     Теперь слой, где все камни уже ждут или падают, цепочку дальше не передаёт.
 /// </summary>
 public static class BlockBehaviorUnstableRockPatch
 {
-    // Защищённые поля BlockBehaviorUnstableRock — FieldRef даёт доступ без оверхеда
     private static readonly AccessTools.FieldRef<BlockBehaviorUnstableRock, AssetLocation> _fallSoundRef =
         AccessTools.FieldRefAccess<BlockBehaviorUnstableRock, AssetLocation>("fallSound");
 
@@ -39,9 +38,6 @@ public static class BlockBehaviorUnstableRockPatch
     private static readonly AccessTools.FieldRef<BlockBehaviorUnstableRock, Block> _collapsedBlockRef =
         AccessTools.FieldRefAccess<BlockBehaviorUnstableRock, Block>("collapsedBlock");
 
-    /// <summary>
-    /// Вернув false, мы полностью пропускаем тело originalного метода.
-    /// </summary>
     [HarmonyPrefix]
     [HarmonyPatch(typeof(BlockBehaviorUnstableRock), "collapseLayer")]
     public static bool collapseLayer_Prefix(
@@ -50,14 +46,16 @@ public static class BlockBehaviorUnstableRockPatch
         IOrderedEnumerable<BlockPos> yorderedPositions,
         int y)
     {
-        var fsm = world.Api.ModLoader.GetModSystem<FSM>();
+        // Менеджера нет, выключен или идёт Dispose: ваниль. Раньше при fsm == null слой молча пропускался,
+        // и камни не обваливались вообще.
+        if (!FallingSpawnManager.IsActive)
+            return true;
 
         AssetLocation fallSound = _fallSoundRef(__instance);
         float impactDamageMul = _impactDamageMulRef(__instance);
         float dustIntensity = _dustIntensityRef(__instance);
 
-        Block block;
-        BlockBehaviorUnstableRock bh;
+        bool anyNew = false;
 
         foreach (BlockPos pos in yorderedPositions)
         {
@@ -66,52 +64,58 @@ public static class BlockBehaviorUnstableRockPatch
 
             if (pos.Y > y)
             {
-                // Захватываем nextY для лямбды — pos.Y это Y следующего слоя
+                // Захватываем nextY для лямбды: pos.Y это Y следующего слоя
                 int nextY = pos.Y;
                 world.Api.Event.RegisterCallback(
                     (dt) => collapseLayer_Prefix(__instance, world, yorderedPositions, nextY),
                     200);
-                return false; // не даём отработать оригиналу
+                return false;
             }
 
-            block = world.BlockAccessor.GetBlock(pos, BlockLayersAccess.Solid);
-            bh = block.GetBehavior<BlockBehaviorUnstableRock>();
+            Block block = world.BlockAccessor.GetBlock(pos, BlockLayersAccess.Solid);
+            BlockBehaviorUnstableRock bh = block.GetBehavior<BlockBehaviorUnstableRock>();
 
-            if (bh == null || fsm == null)
+            if (bh == null)
                 continue;
 
-            FallingSpawnManager.RequestSpawn(
-                _collapsedBlockRef(bh),
-                world.BlockAccessor.GetBlockEntity(pos),
-                pos,
-                fallSound: fallSound,
-                impactDamageMul: impactDamageMul,
-                canFallSideways: true,
-                dustIntensity: dustIntensity
-            );
+            // true только для новой заявки. Камни, которые уже ждут или падают, ничего нового не дают.
+            if (FallingSpawnManager.RequestSpawn(
+                    _collapsedBlockRef(bh),
+                    world.BlockAccessor.GetBlockEntity(pos),
+                    pos,
+                    fallSound: fallSound,
+                    impactDamageMul: impactDamageMul,
+                    canFallSideways: true,
+                    dustIntensity: dustIntensity))
+            {
+                anyNew = true;
+            }
         }
 
-        // Сдвигаем проверки соседних ярусов по времени, чтобы цепной обвал не переполнил
-        // стек колбэков, если сразу сыпется целый пласт.
+        // В слое нет ничего нового: цепочку проверок соседей не продолжаем.
+        if (!anyNew)
+            return false;
+
+        // Проверки соседних ярусов сдвигаем по времени, чтобы цепной обвал не переполнил стек колбэков.
         BlockPos firstpos = yorderedPositions.First();
         for (int i = 0; i < 3; i++)
         {
             BlockPos npos = firstpos.AddCopy(
                 world.Rand.Next(17) - 8, 0, world.Rand.Next(17) - 8);
 
-            int delay = 300 + i * 100; // 300, 400, 500 ms
+            int delay = 300 + i * 100; // 300, 400, 500 мс
             world.Api.Event.RegisterCallback(
                 (dt) => BlockBehaviorUnstableRockHelper.CheckCollapsibleNeighbours(__instance, world, npos),
                 delay);
         }
 
-        return false; // не даём отработать оригиналу
+        return false;
     }
 }
 
 /// <summary>
-/// Тонкая оболочка вокруг защищённого checkCollapsibleNeighbours. Нужна, чтобы лямбда
-/// в колбэке могла вызвать метод без рефлексии на каждом вызове.
+/// Тонкая оболочка вокруг защищённого checkCollapsibleNeighbours, чтобы лямбда в колбэке
+/// вызывала его без рефлексии на каждом вызове.
 /// </summary>
 internal static class BlockBehaviorUnstableRockHelper
 {

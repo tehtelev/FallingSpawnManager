@@ -1,5 +1,4 @@
-﻿using FSMMgr.Managers;
-using FSMMgr.Utils;
+using FSMMgr.Managers;
 using HarmonyLib;
 using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
@@ -13,7 +12,6 @@ namespace FSMMgr.Patches;
 /// </summary>
 public static class BlockBehaviorUnstableFallingPatch
 {
-    // Доступ к приватным полям исходного класса через FieldRef, обращение без оверхеда
     private static readonly AccessTools.FieldRef<BlockBehaviorUnstableFalling, AssetLocation> _fallSoundRef =
         AccessTools.FieldRefAccess<BlockBehaviorUnstableFalling, AssetLocation>("fallSound");
 
@@ -33,32 +31,31 @@ public static class BlockBehaviorUnstableFallingPatch
         IWorldAccessor world,
         BlockPos ourPos)
     {
-        var fsm = world.Api.ModLoader.GetModSystem<FSM>();
-        if (fsm == null)
-            return true; // менеджера нет, даём отработать originalному коду
+        // Менеджер выключен или идёт его Dispose: отрабатывает ванильный код.
+        if (!FallingSpawnManager.IsActive)
+            return true;
 
-
-        Block block = world.BlockAccessor.GetBlock(ourPos);
-
-        if (_variantAfterFalling(__instance) != (AssetLocation)null)
-            block = world.BlockAccessor.GetBlock(_variantAfterFalling(__instance));
-
-        BlockEntity be = world.BlockAccessor.GetBlockEntity(ourPos);
-
+        // Исходный блок на позиции. Падающий вариант (rock-granite -> crackedrock-granite) хранится отдельно:
+        // по исходному блоку заявка потом проверяется, по варианту блок ставится.
         Block currentBlock = world.BlockAccessor.GetBlock(ourPos);
 
         // Тот же чек, что в ванилле: блок на позиции уже не наш.
         if (__instance.block != currentBlock)
             return false;
 
-        // Ваничный FallingEntityAlreadyExists: если в мире уже есть EntityBlockFalling
-        // с этим initialPos, не плодим вторую. У нас есть O(1) версия этого в менеджере.
+        // Ванильный FallingEntityAlreadyExists, но за O(1) через менеджер.
         if (FallingSpawnManager.IsPositionActiveOrPending(ourPos))
             return false;
 
-        // Вместо спавна сущности просим менеджер взять заявку на падение
+        Block fallingBlock = currentBlock;
+        AssetLocation variant = _variantAfterFalling(__instance);
+        if (variant != null)
+            fallingBlock = world.BlockAccessor.GetBlock(variant);
+
+        BlockEntity be = world.BlockAccessor.GetBlockEntity(ourPos);
+
         FallingSpawnManager.RequestSpawn(
-            block,
+            fallingBlock,
             be,
             ourPos,
             _fallSoundRef(__instance),
@@ -69,8 +66,6 @@ public static class BlockBehaviorUnstableFallingPatch
             positionOffset: null
         );
 
-        return false; // тело originalного метода больше не выполняется
+        return false; // тело оригинального метода больше не выполняется
     }
-    
-
 }

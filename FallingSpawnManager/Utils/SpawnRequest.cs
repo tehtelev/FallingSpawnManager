@@ -1,4 +1,4 @@
-﻿using Vintagestory.API.Common;
+using Vintagestory.API.Common;
 using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
 
@@ -11,6 +11,12 @@ namespace FSMMgr.Utils
     public struct SpawnRequest
     {
         public Block Block;
+
+        // Блок, который реально лежит на initialPos в момент постановки заявки.
+        // Нужен для sourceBlock-валидации в ProcessEntityQueue (стратум): если на позиции
+        // уже другой блок, сущность не спавним.
+        public Block SourceBlock;
+
         public BlockEntity BlockEntity;
 
         // Снимок атрибутов BE, сделанный в момент RequestSpawn.

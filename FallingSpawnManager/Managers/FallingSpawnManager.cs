@@ -1,4 +1,4 @@
-﻿using FSMMgr.Patches;
+using FSMMgr.Patches;
 using FSMMgr.Utils;
 using System;
 using System.Collections.Generic;
@@ -15,200 +15,240 @@ namespace FSMMgr.Managers
     /// <summary>
     /// Серверный менеджер спавна падающих блоков.
     /// Ограничивает число одновременно существующих EntityBlockFalling, ставит заявки
-    /// в очередь и прогоняет мгновенную симуляцию для блоков за пределами видимости игроков.
+    /// в очередь и разрешает падение без сущности для блоков, рядом с которыми нет игроков.
     ///
-    /// Мгновенная симуляция (SimulateInstantFall) выполняется не синхронно внутри
-    /// RequestSpawn, а через отдельную очередь с лимитом на тик (instantQueue /
-    /// maxInstantPerTick). pendingPositions применяется как guard для обеих веток:
-    /// и для очереди сущностей, и для мгновенной очереди. Это защищает от повторной
-    /// обработки одной и той же позиции и от каскада синхронных SetBlock/ExchangeBlock
-    /// вызовов при массовом обрушении, которое забивало главный поток на десятки секунд.
+    /// Игрок рядом (радиус слежения за сущностями, по умолчанию 128 блоков): заявка идёт в
+    /// requestQueue, сущность создаётся, пока живых меньше maxFallingLimit.
+    /// Игрока нет: заявка идёт в instantQueue, падение разрешается без сущности
+    /// (SimulateInstantFall), не более maxInstantPerTick за тик.
     ///
-    /// Проверка " не занята ли позиция уже существующей сущностью" раньше делалась
-    /// через sapi.World.GetNearestEntity(...): пространственный запрос по партиционированию
-    /// мира (проход по entity-партициям в радиусе плюс аллокации и лямбда на каждую попавшую
-    /// сущность), вызывавшийся на заявку в очереди каждый тик. Теперь то же самое
-    /// делается за O(1) через activeFallingPositions, набор initialPos всех сейчас активных
-    /// EntityBlockFalling, который поддерживается в актуальном состоянии событиями
-    /// OnEntitySpawn/OnEntityLoaded/OnEntityDespawn.
+    /// Обе очереди строго FIFO. Соседние блоки колонны просят упасть снизу вверх, и случайный выбор
+    /// тратил бюджет на блоки, под которыми опора ещё на месте. FIFO на 6400 блоков с лимитом 1000
+    /// разгружался быстрее (645-1245 тиков против 780-1920).
     ///
-    /// Это статический менеджер со своим чистым функционалом. Инициализацию мода,
-    /// загрузку конфигов и применение патчей курирует FSM (FSM.cs).
+    /// Отличия от ванили (намеренные):
+    ///  - блок, которого просили упасть только вбок и у которого внизу твёрдая опора, остаётся на месте;
+    ///  - снег, упавший на снежный блок, добавляет слой над ним, а не впитывается;
+    ///  - заявки, которые ждут в очереди при остановке сервера, разрешаются в Dispose, но заявки колонн,
+    ///    выгруженных раньше, остаются на стартовых клетках. Сущности в полёте при выгрузке колонны
+    ///    остаются ванили: сохраняются с чанком и приземляются после загрузки;
+    ///  - requestQueue общая на весь сервер: пока идёт большой обвал, новый блок другого игрока ждёт в хвосте;
+    ///  - проверки соседей в BlockBehaviorUnstableRock разнесены на 300/400/500 мс.
+    ///
+    /// Потоки: при RegionTicking падающие сущности тикают в рабочих потоках, поэтому
+    /// activeFallingPositions / trackedEntityIds / freedEntityIds / totalFallingBlocks защищены lock'ом.
+    /// Очереди и изменения блоков только в главном потоке.
     /// </summary>
     public static class FallingSpawnManager
     {
-        // Флаг инициализации, чтобы не регистрировать события повторно при перезагрузке мода
-        private static bool _initialized = false;
+        // Один повтор за тик, примерно 10 секунд при тике очереди 32 мс.
+        private const int MaxRetries = 300;
+        private const int MaxFlushOnDispose = 100000;
 
-        // Общее число загруженных сущностей EntityBlockFalling на сервере
-        private static int totalFallingBlocks = 0;
-
-        // Набор initialPos всех сейчас активных (заспавненных) EntityBlockFalling.
-        // Заполняется в OnEntitySpawn/OnEntityLoaded, чистится в OnEntityDespawn, симметрично
-        // totalFallingBlocks выше. Заменяет дорогой sapi.World.GetNearestEntity(...)
-        // в ProcessEntityQueue: O(1) HashSet.Replace вместо пространственного запроса.
-        private static HashSet<BlockPos> activeFallingPositions = [];
-
-        // Заявки на спавн сущностей, которые ждут свободного слота.
-        // Список со случайным выбором элемента (см. PopRandom) вместо строгого FIFO даёт
-        // более естественный порядок обвала, сохраняя O(1) на извлечение через приём
-        // "поменять с последним и убрать последний".
-        private static List<SpawnRequest> requestQueue = [];
-
-        // Отдельная очередь для заявок на мгновенную симуляцию (когда игрока рядом нет).
-        // Такие заявки обрабатываются порциями в ProcessInstantQueue, а не синхронно внутри RequestSpawn.
-        private static List<SpawnRequest> instantQueue = [];
-
-        // Общий генератор случайных чисел для выбора следующей заявки на обработку.
-        // Доступ только из серверного тика (однопоточно), поэтому обычный Random безопасен.
-        private static readonly Random _rng = new Random();
-
-
-        // Сколько мгновенных симуляций разрешено прогонять за один тик менеджера.
-        // Ограничивает нагрузку на главный поток при массовых обрушениях вне зоны видимости игроков.
-        // Настраивается через конфиг (см. FSMConfig.MaxInstantPerTick).
-        public static int maxInstantPerTick;
-
-        // Позиции, у которых уже есть заявка, чтобы не дублировать спавн.
-        // Сюда попадают позиции из обеих очередей (requestQueue и instantQueue), что и есть
-        // guard от реентерабельной обработки одной и той же позиции.
-        private static HashSet<BlockPos> pendingPositions = [];
+        private static bool _initialized;
+        // Выставляется на время Dispose: хуки в этот момент идут по ванильному пути,
+        // чтобы SetBlock во время слива не добавлял заявки в очередь, которую сливают.
+        private static bool _disposing;
 
         private static ICoreServerAPI sapi;
+        private static long tickListenerId;
 
-        // Радиус вокруг игрока, в котором создаются сущности (в блоках)
+        // Защищает четыре поля ниже (см. «Потоки» в шапке).
+        private static readonly object activeLock = new();
+
+        // Число живых EntityBlockFalling. Считается строго по trackedEntityIds, поэтому повторный
+        // OnEntitySpawn/OnEntityLoaded одной и той же сущности не может завысить счётчик.
+        private static int totalFallingBlocks;
+        private static readonly HashSet<long> trackedEntityIds = [];
+
+        // Сущности, у которых позиция уже освобождена (упали дальше чем на блок), чтобы не удалить
+        // её второй раз у новой сущности на том же initialPos.
+        private static readonly HashSet<long> freedEntityIds = [];
+
+        // initialPos всех живых сущностей. O(1) вместо GetNearestEntity.
+        private static readonly HashSet<BlockPos> activeFallingPositions = [];
+
+        private static readonly Queue<SpawnRequest> requestQueue = new();
+        private static readonly Queue<SpawnRequest> instantQueue = new();
+
+        // Заявки, у которых позиция занята в этом тике. Возвращаются в очередь после цикла,
+        // чтобы каждая повторялась раз в тик, а не крутилась внутри одного тика.
+        private static readonly List<SpawnRequest> blockedThisTick = [];
+
+        // Позиции с заявкой в любой из очередей. Всегда приватные копии, никогда BlockPos вызывающего
+        // (вызывающий может его менять, например snowshovel).
+        private static readonly HashSet<BlockPos> pendingPositions = [];
+
         private static int activeRange = 128;
 
-        // Максимальное число падающих блоков
+        public static int maxInstantPerTick;
         public static int maxFallingLimit;
 
-        // Сторожевой таймер (мс) против известного vanilla-бага "Falling block
-        // entity does not settle" (форум VS #5775): падающие сущности при массовом
-        // обвале могут скучиваться и физически застревать друг об друга, никогда не
-        // приземляясь сами, даже рядом с игроком. Используется в EntityBlockFallingPatch:
-        // если сущность жива дольше этого времени и всё ещё не приземлилась, её
-        // принудительно укладывают на текущей позиции. 0 отключает таймер полностью.
+        // Сторожевой таймер (мс) против vanilla-бага "Falling block entity does not settle".
+        // 0 отключает только этот таймер. Проверка "рядом нет игрока" работает всегда.
         public static int stuckTimeoutMs;
 
+        /// <summary> Менеджер работает и хуки должны использовать его, а не ваниль. </summary>
+        public static bool IsActive => _initialized && !_disposing;
 
-        /// <summary>
-        /// Инициализация менеджера: санитизация настроек из конфига, регистрация
-        /// событий мира и тик-листенер очередей. Вызывается FSM после применения патчей.
-        /// </summary>
         public static void Initialize(ICoreServerAPI api, FSMConfig cfg)
         {
-            if (_initialized)
-                return; // защита от повторного старта/патчинга
+            if (_initialized) return;
 
             sapi = api;
 
-            // Обрезаем значение до валидного диапазона
             maxFallingLimit = Math.Clamp(cfg.MaxFallingLimit, 10, 10000);
-
-            // MaxInstantPerTick настраивается из config (по умолчанию 100). Нижняя граница 1,
-            // значение 0 отключило бы троттлинг и вернуло старое поведение "выполнить всё разом",
-            // которое и вызывала лаг. Верхнюю границу берём с запасом.
+            // 0 отключил бы троттлинг и вернул "всё за один тик".
             maxInstantPerTick = Math.Clamp(cfg.MaxInstantPerTick, 1, 10000);
-
-            // StuckTimeoutMs настраивается из config (по умолчанию 15000 мс = 15 сек).
-            // В отличие от MaxInstantPerTick, здесь 0 является валидным значением и отключает
-            // сторожевой таймер полностью (см. EntityBlockFallingPatch.OnGameTick).
-            // Верхнюю границу берём в 2 минуты, больше не имеет практического смысла.
             stuckTimeoutMs = Math.Clamp(cfg.StuckTimeoutMs, 0, 120000);
 
-            // Радиус слежения берём из настроек сервера
             try
             {
-                int trackingChunks = api.World.DefaultEntityTrackingRange;
-                activeRange = trackingChunks * GlobalConstants.ChunkSize;
+                activeRange = api.World.DefaultEntityTrackingRange * GlobalConstants.ChunkSize;
             }
-            catch { /* оставляем дефолтное значение 128 */ }
+            catch { /* оставляем 128 */ }
 
             api.Event.OnEntitySpawn += OnEntitySpawn;
             api.Event.OnEntityLoaded += OnEntityLoaded;
             api.Event.OnEntityDespawn += OnEntityDespawn;
 
-            // Тик очереди спавна каждые 32 мс
-            api.Event.RegisterGameTickListener(OnGameTick, 32);
+            tickListenerId = api.Event.RegisterGameTickListener(OnGameTick, 32);
 
             _initialized = true;
         }
 
-        /// <summary>
-        /// Очистка менеджера при выгрузке мода: чистим очереди и отвязываем события,
-        /// чтобы не держать ссылки на объекты мира. Патчи снимает fsm
-        /// </summary>
         public static void Dispose()
         {
-            requestQueue?.Clear();
-            instantQueue?.Clear();
-            pendingPositions?.Clear();
-            activeFallingPositions?.Clear(); // чистим и набор активных позиций
-            totalFallingBlocks = 0;
+            if (!_initialized) return;
+
+            // Сначала выключаем хуки: SetBlock во время слива может дойти до RequestSpawn.
+            _disposing = true;
+
             if (sapi != null)
             {
+                if (tickListenerId != 0)
+                {
+                    sapi.Event.UnregisterGameTickListener(tickListenerId);
+                    tickListenerId = 0;
+                }
                 sapi.Event.OnEntitySpawn -= OnEntitySpawn;
                 sapi.Event.OnEntityLoaded -= OnEntityLoaded;
                 sapi.Event.OnEntityDespawn -= OnEntityDespawn;
+
+                // Мир ещё жив (игроки отключены, сохранение после Dispose модов): разрешаем всё,
+                // что осталось, чтобы блоки не сохранились на стартовых клетках.
+                IWorldAccessor world = sapi.World;
+                if (world != null)
+                {
+                    FlushQueue(world, instantQueue);
+                    FlushQueue(world, requestQueue);
+                    List<SpawnRequest> blocked = new(blockedThisTick);
+                    foreach (SpawnRequest r in blocked) ResolveInstant(world, r, recheck: false);
+                }
             }
 
-            _initialized = false; // для повторного старта после релоада
+            requestQueue.Clear();
+            instantQueue.Clear();
+            blockedThisTick.Clear();
+            pendingPositions.Clear();
+            lock (activeLock)
+            {
+                activeFallingPositions.Clear();
+                trackedEntityIds.Clear();
+                freedEntityIds.Clear();
+                totalFallingBlocks = 0;
+            }
+
+            _initialized = false;
+            _disposing = false;
         }
 
+        // Очередь сливается через Dequeue, а не foreach: даже если хук добавит заявку, MoveNext не бросит.
+        private static void FlushQueue(IWorldAccessor world, Queue<SpawnRequest> queue)
+        {
+            int flushed = 0;
+            while (flushed++ < MaxFlushOnDispose && queue.Count > 0)
+                ResolveInstant(world, queue.Dequeue(), recheck: false);
+        }
+
+        // =====================================================================
+        //  Учёт живых сущностей
+        // =====================================================================
 
         public static bool IsPositionActiveOrPending(BlockPos pos)
         {
-            return pendingPositions.Contains(pos) || activeFallingPositions.Contains(pos);
+            return pendingPositions.Contains(pos) || IsActivePosition(pos);
         }
 
-
-        /// <summary>
-        /// Достаёт случайный элемент из списка за O(1): меняет местами с последним
-        /// и удаляет последний. Порядок оставшихся элементов при этом не сохраняется,
-        ///но нам порядок и не нужен, это и весь смысл.
-        /// </summary>
-        private static SpawnRequest PopRandom(List<SpawnRequest> list)
+        private static bool IsActivePosition(BlockPos pos)
         {
-            int index = _rng.Next(list.Count);
-            SpawnRequest picked = list[index];
-            int lastIndex = list.Count - 1;
-            list[index] = list[lastIndex];
-            list.RemoveAt(lastIndex);
-            return picked;
+            lock (activeLock) return activeFallingPositions.Contains(pos);
         }
 
-        // Считаем только EntityBlockFalling, а не живых существ.
-        // Помимо счётчика totalFallingBlocks, теперь также поддерживаем
-        // activeFallingPositions, набор initialPos активных сущностей, который
-        // заменяет дорогой пространственный запрос в ProcessEntityQueue.
-        private static void OnEntitySpawn(Entity entity)
+        private static int LiveFallingCount
         {
-            if (entity.IsCreature || entity is not EntityBlockFalling ebf) return;
-            totalFallingBlocks++;
-            activeFallingPositions.Add(ebf.initialPos);
+            get { lock (activeLock) return totalFallingBlocks; }
         }
 
-        private static void OnEntityLoaded(Entity entity)
+        private static void Track(Entity entity)
         {
-            if (entity.IsCreature || entity is not EntityBlockFalling ebf) return;
-            totalFallingBlocks++;
-            activeFallingPositions.Add(ebf.initialPos);
+            if (entity is not EntityBlockFalling ebf || ebf.initialPos == null) return;
+            lock (activeLock)
+            {
+                if (!trackedEntityIds.Add(ebf.EntityId)) return; // уже учтена
+                totalFallingBlocks++;
+                activeFallingPositions.Add(ebf.initialPos);
+            }
         }
+
+        private static void OnEntitySpawn(Entity entity) => Track(entity);
+        private static void OnEntityLoaded(Entity entity) => Track(entity);
 
         private static void OnEntityDespawn(Entity entity, EntityDespawnData despawn)
         {
-            if (entity.IsCreature || entity is not EntityBlockFalling ebf) return;
-            totalFallingBlocks--;
-            activeFallingPositions.Remove(ebf.initialPos);
+            if (entity is not EntityBlockFalling ebf) return;
+            lock (activeLock)
+            {
+                if (!trackedEntityIds.Remove(ebf.EntityId)) return;
+                totalFallingBlocks = Math.Max(0, totalFallingBlocks - 1);
+                // Позицию уже могли освободить: за это время на initialPos мог появиться новый блок
+                // с новой сущностью, и второе удаление разрешило бы ей упасть дважды.
+                if (!freedEntityIds.Remove(ebf.EntityId) && ebf.initialPos != null)
+                    activeFallingPositions.Remove(ebf.initialPos);
+            }
         }
 
         /// <summary>
-        /// Обрабатываем очереди спавна каждый тик:
-        ///   1) очередь сущностей ограничена maxFallingLimit;
-        ///   2).queue мгновенных симуляций ограничена maxInstantPerTick, чтобы массовое
-        ///      обрушение вне зоны видимости игроков размазилось по многим тикам,
-        ///      а не выполнялось одним синхронным ударом.
+        /// Освобождает слот дедупликации, когда сущность упала дальше чем на блок (окно дубликатов как в ванили).
+        /// Счётчик живых не трогает. Повторный вызов безопасен.
         /// </summary>
+        public static void ReleasePosition(EntityBlockFalling ebf)
+        {
+            if (ebf.initialPos == null) return;
+            lock (activeLock)
+            {
+                if (!trackedEntityIds.Contains(ebf.EntityId)) return;
+                if (!freedEntityIds.Add(ebf.EntityId)) return;
+                activeFallingPositions.Remove(ebf.initialPos);
+            }
+        }
+
+        public static bool HasPlayerNearby(Vec3d pos)
+        {
+            float rangeSq = (float)activeRange * activeRange;
+            foreach (IPlayer player in sapi.World.AllOnlinePlayers)
+            {
+                EntityPlayer eplr = player.Entity;
+                if (eplr != null && eplr.Pos.InRangeOf(pos, rangeSq, activeRange))
+                    return true;
+            }
+            return false;
+        }
+
+        // =====================================================================
+        //  Тик очередей
+        // =====================================================================
+
         private static void OnGameTick(float dt)
         {
             ProcessEntityQueue();
@@ -217,127 +257,188 @@ namespace FSMMgr.Managers
 
         private static void ProcessEntityQueue()
         {
-            SpawnRequest request;
-            Block block;
+            IWorldAccessor world = sapi.World;
 
-            while (totalFallingBlocks < maxFallingLimit && requestQueue.Count > 0)
+            while (LiveFallingCount < maxFallingLimit && requestQueue.Count > 0)
             {
-                request = PopRandom(requestQueue);
-
-                block = sapi.World.BlockAccessor.GetBlock(request.InitialPos);
-                if (block == null || block.Id == 0 || block != request.Block)
+                SpawnRequest request = requestQueue.Dequeue();
+                // try/catch на заявку: исключение (мод в GetDrops/OnFallOnto) не должно
+                // обрывать тик и оставлять guard висеть.
+                try
                 {
-                    pendingPositions.Remove(request.InitialPos);   // блок уже не тот, снимаем guard
-                    continue;
+                    ProcessEntityRequest(world, request);
                 }
-
-                bool existing = activeFallingPositions.Contains(request.InitialPos);
-                if (existing)
+                catch (Exception e)
                 {
-                    request.RetryCount++;
-                    if (request.RetryCount >= 300)
-                    {
-                        pendingPositions.Remove(request.InitialPos);
-                        var drops = request.Block.GetDrops(sapi.World, request.InitialPos, null);
-                        EntityBlockFallingPatch.SpawnDrops(sapi.World, request.InitialPos, drops, request.BlockEntity);
-                        continue;
-                    }
-                    // guard остаётся висеть, заявка всё ещё «в работе»
-                    requestQueue.Add(request);
-                    continue;
+                    pendingPositions.Remove(request.InitialPos);
+                    sapi.Logger.Warning("[FSM] Falling request failed at {0}: {1}", request.InitialPos, e.Message);
                 }
+            }
 
-                // Создаём сущность и применяем смещение позиции, если оно задано
-                var entityBf = new EntityBlockFalling(
-                    request.Block, request.BlockEntity, request.InitialPos,
-                    request.FallSound, request.ImpactDamageMul,
-                    request.CanFallSideways, request.DustIntensity)
-                {
-                    DoRemoveBlock = request.DoRemoveBlock
-                };
-
-                sapi.World.SpawnEntity(entityBf);
-
-                if (request.PositionOffset != null && request.PositionOffset != Vec3d.Zero)
-                {
-                    entityBf.Pos.X += request.PositionOffset.X;
-                    entityBf.Pos.Y += request.PositionOffset.Y;
-                    entityBf.Pos.Z += request.PositionOffset.Z;
-                }
-
-                // только теперь снимаем guard, entity уже в activeFallingPositions (OnEntitySpawn отработал)
-                pendingPositions.Remove(request.InitialPos);
-
+            // Заблокированные возвращаем после цикла: один повтор за тик.
+            if (blockedThisTick.Count > 0)
+            {
+                foreach (SpawnRequest blocked in blockedThisTick) requestQueue.Enqueue(blocked);
+                blockedThisTick.Clear();
             }
         }
 
-        // Метод обработки очереди мгновенных симуляций с лимитом на тик.
+        private static void ProcessEntityRequest(IWorldAccessor world, SpawnRequest request)
+        {
+            // Сравниваем с исходным блоком, а не с падающим вариантом (rock-granite падает как crackedrock-granite).
+            Block current = world.BlockAccessor.GetBlock(request.InitialPos);
+            if (current == null || current.Id == 0 || current != request.SourceBlock)
+            {
+                pendingPositions.Remove(request.InitialPos);
+                RecheckReplacedBlock(world, request, current);
+                return;
+            }
+
+            if (IsActivePosition(request.InitialPos))
+            {
+                request.RetryCount++;
+                if (request.RetryCount >= MaxRetries)
+                {
+                    pendingPositions.Remove(request.InitialPos);
+                    GiveUp(world, request);
+                    return;
+                }
+                blockedThisTick.Add(request);
+                return;
+            }
+
+            // Живой BE на момент спавна: заявка могла ждать долго, а блок мог быть сломан и поставлен заново.
+            // Старый BE сериализовал бы устаревшее содержимое и дублировал бы инвентарь.
+            EntityBlockFalling entityBf = new(
+                request.Block, world.BlockAccessor.GetBlockEntity(request.InitialPos), request.InitialPos,
+                request.FallSound, request.ImpactDamageMul,
+                request.CanFallSideways, request.DustIntensity)
+            {
+                DoRemoveBlock = request.DoRemoveBlock
+            };
+
+            world.SpawnEntity(entityBf);
+
+            if (request.PositionOffset != null && request.PositionOffset != Vec3d.Zero)
+            {
+                entityBf.Pos.X += request.PositionOffset.X;
+                entityBf.Pos.Y += request.PositionOffset.Y;
+                entityBf.Pos.Z += request.PositionOffset.Z;
+            }
+
+            // Initialize/OnEntitySpawn уже внесли позицию в activeFallingPositions.
+            pendingPositions.Remove(request.InitialPos);
+        }
+
+        // Заявка не получила позицию за MaxRetries тиков. Блок всё ещё стоит на месте (источник только что проверен),
+        // поэтому его нужно убрать ДО выдачи предметов, иначе предметы дублируются.
+        // Заявка, которая не владеет блоком (DoRemoveBlock=false, например угольная куча), просто заканчивается.
+        private static void GiveUp(IWorldAccessor world, SpawnRequest request)
+        {
+            if (!request.DoRemoveBlock) return;
+
+            ItemStack[] drops = request.Block.GetDrops(world, request.InitialPos, null);
+            BlockEntity liveBe = world.BlockAccessor.GetBlockEntity(request.InitialPos);
+            world.BlockAccessor.SetBlock(0, request.InitialPos);
+            world.BlockAccessor.TriggerNeighbourBlockUpdate(request.InitialPos);
+            EntityBlockFallingPatch.SpawnDrops(world, request.InitialPos, drops, liveBe);
+        }
+
+        // Пока заявка ждала, в клетке оказался другой блок (игрок выкопал песок и поставил гравий).
+        // Его собственный createFallingBlock был пропущен guard'ом, и больше его никто не спросит,
+        // поэтому даём ему перепроверить себя. Нужный путь (сущность/instant) выберет его же хук.
+        private static void RecheckReplacedBlock(IWorldAccessor world, SpawnRequest request, Block current)
+        {
+            if (current == null || current.Id == 0) return;
+            BlockPos pos = request.InitialPos;
+            current.OnNeighbourBlockChange(world, pos, pos.DownCopy());
+        }
+
+        // В контейнеры могут класть предметы, пока падение ждёт в очереди. Сохраняем живое содержимое.
+        // Остальные BE остаются со снимком на момент заявки (в том числе если исходный BE уже исчез).
+        private static void RefreshContainerSnapshot(IWorldAccessor world, ref SpawnRequest request)
+        {
+            BlockEntity liveBe = world.BlockAccessor.GetBlockEntity(request.InitialPos);
+            if (liveBe is not IBlockEntityContainer) return;
+
+            TreeAttribute fresh = new();
+            liveBe.ToTreeAttributes(fresh);
+            request.BlockEntity = liveBe;
+            request.BlockEntityTree = fresh;
+        }
+
         private static void ProcessInstantQueue()
         {
+            IWorldAccessor world = sapi.World;
             int processed = 0;
 
             while (processed < maxInstantPerTick && instantQueue.Count > 0)
             {
-                var request = PopRandom(instantQueue);
-
+                SpawnRequest request = instantQueue.Dequeue();
                 pendingPositions.Remove(request.InitialPos);
+                processed++;
+                ResolveInstant(world, request, recheck: true);
+            }
+        }
 
-                Block currentBlock = sapi.World.BlockAccessor.GetBlock(request.InitialPos);
-                if (currentBlock == null || currentBlock.Id == 0 || currentBlock != request.Block)
+        // Общий путь для тика и слива при остановке. recheck=false при сливе: хуки там уже выключены.
+        private static void ResolveInstant(IWorldAccessor world, SpawnRequest request, bool recheck)
+        {
+            try
+            {
+                Block current = world.BlockAccessor.GetBlock(request.InitialPos);
+                if (current == null || current.Id == 0 || current != request.SourceBlock)
                 {
-                    processed++;
-                    continue;
+                    if (recheck) RecheckReplacedBlock(world, request, current);
+                    return;
                 }
 
-                var drops = request.Block.GetDrops(sapi.World, request.InitialPos, null);
+                RefreshContainerSnapshot(world, ref request);
 
-                // Передаём СНИМОК (BlockEntityTree), а не живой BE. Живой BE передаётся
-                // только ради DropContents контейнера — если блок не сможет лечь на место.
+                ItemStack[] drops = request.Block.GetDrops(world, request.InitialPos, null);
+
+                // Снимок (BlockEntityTree), а не живой BE. Живой нужен только для DropContents.
                 EntityBlockFallingPatch.SimulateInstantFall(
-                    sapi.World,
+                    world,
                     request.Block,
+                    request.SourceBlock,
                     request.BlockEntity,
                     request.BlockEntityTree,
                     request.InitialPos,
                     drops,
                     request.DoRemoveBlock);
-
-                processed++;
+            }
+            catch (Exception e)
+            {
+                try { sapi?.Logger.Warning("[FSM] Instant fall failed at {0}: {1}", request.InitialPos, e.Message); }
+                catch (Exception) { /* логгер мог уже закрыться */ }
             }
         }
 
+        // =====================================================================
+        //  Постановка заявки
+        // =====================================================================
+
         /// <summary>
-        /// Просит блок упасть.
-        /// Если игрок рядом, создаёт заявку на спавн сущности (в очередь, если достигнут лимит).
-        /// Если игрока нет рядом — ставит заявку в队列 мгновенной симуляции.
+        /// Просит блок упасть. Возвращает true, если создана НОВАЯ заявка, и false, если позиция уже в работе
+        /// или менеджер выключен (вызывающий хук проверяет IsActive отдельно). Рок-патч использует результат,
+        /// чтобы оборвать цепочку обвала, когда в слое нет ничего нового.
         /// </summary>
-        public static void RequestSpawn(Block block, BlockEntity be, BlockPos initialPos,
+        public static bool RequestSpawn(Block block, BlockEntity be, BlockPos initialPos,
             AssetLocation fallSound, float impactDamageMul,
             bool canFallSideways, float dustIntensity,
             bool doRemoveBlock = true, Vec3d positionOffset = null)
         {
-            if (pendingPositions.Contains(initialPos))
-                return;
+            if (!IsActive) return false;
 
-            pendingPositions.Add(initialPos);
+            // Приватная копия: вызывающий может менять свой BlockPos.
+            BlockPos pos = initialPos.Copy();
+            if (!pendingPositions.Add(pos)) return false;
 
-            bool hasPlayerNearby = false;
-            Vec3d posVec = initialPos.ToVec3d();
-            EntityPlayer eplr;
-            foreach (IPlayer player in sapi.World.AllOnlinePlayers)
-            {
-                eplr = player.Entity;
-                if (eplr != null && eplr.Pos.InRangeOf(posVec, activeRange * activeRange, activeRange))
-                {
-                    hasPlayerNearby = true;
-                    break;
-                }
-            }
+            bool hasPlayerNearby = HasPlayerNearby(pos.ToVec3d());
 
-            // Снимок BE делаем ЗДЕСЬ, пока блок ещё не снят и инвентарь ещё в исходном
-            // состоянии. Для instant-пути это критично: там нет EntityBlockFalling.Initialize,
-            // который бы сделал снимок сам, а живой BE к моменту обработки очереди
-            // может быть уже изменён/удалён (см. BlockEntityCoalPile.TryPartialCollapse).
+            // Снимок BE делаем здесь, пока блок ещё на месте. У instant-пути нет Initialize, который
+            // сделал бы его сам, а живой BE к моменту очереди может измениться или исчезнуть.
             TreeAttribute beTree = null;
             if (be != null)
             {
@@ -345,12 +446,13 @@ namespace FSMMgr.Managers
                 be.ToTreeAttributes(beTree);
             }
 
-            var request = new SpawnRequest
+            SpawnRequest request = new()
             {
-                Block = block,
+                Block = block,                                              // падающий/приземляющийся вариант
+                SourceBlock = sapi.World.BlockAccessor.GetBlock(pos),       // исходный блок на позиции
                 BlockEntity = be,
                 BlockEntityTree = beTree,
-                InitialPos = initialPos.Copy(),
+                InitialPos = pos,
                 FallSound = fallSound,
                 ImpactDamageMul = impactDamageMul,
                 CanFallSideways = canFallSideways,
@@ -359,13 +461,9 @@ namespace FSMMgr.Managers
                 PositionOffset = positionOffset ?? Vec3d.Zero
             };
 
-            if (!hasPlayerNearby)
-            {
-                instantQueue.Add(request);
-                return;
-            }
-
-            requestQueue.Add(request);
+            if (hasPlayerNearby) requestQueue.Enqueue(request);
+            else instantQueue.Enqueue(request);
+            return true;
         }
     }
 }
